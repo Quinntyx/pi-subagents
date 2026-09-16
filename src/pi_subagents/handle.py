@@ -62,6 +62,9 @@ class AgentHandle:
 		# latest pi-tool-tree activity (filled by activity polling)
 		self.phase: str | None = None
 		self.label: str | None = None
+		self.label_elapsed_ms: int | None = None
+		self.label_calls: int | None = None
+		self.live_tool: str | None = None
 		self.tool_calls = 0
 		self.thinking_ms = 0
 		# viewer fields: is an await pending on this handle right now?
@@ -97,6 +100,9 @@ class AgentHandle:
 			"thinkingMs": self.thinking_ms,
 			"phase": self.phase,
 			"label": self.label,
+			"labelElapsedMs": self.label_elapsed_ms,
+			"labelCalls": self.label_calls,
+			"liveTool": self.live_tool,
 			"awaited": self.awaited,
 			"ctx": {
 				"tokens": self.ctx_tokens,
@@ -209,9 +215,19 @@ class AgentHandle:
 		activity = snap.get("activity") or snap
 		self.phase = activity.get("phase")
 		self.label = activity.get("label")
+		self.label_elapsed_ms = activity.get("labelElapsedMs", self.label_elapsed_ms)
+		self.label_calls = activity.get("labelCalls", self.label_calls)
 		run = activity.get("run") or {}
 		self.tool_calls = run.get("toolCalls", self.tool_calls)
 		self.thinking_ms = run.get("thinkingMs", self.thinking_ms)
+		calls = activity.get("calls") or []
+		if isinstance(calls, list) and calls:
+			call = calls[0]
+			tool = call.get("toolName") if isinstance(call, dict) else None
+			preview = call.get("argPreview") if isinstance(call, dict) else None
+			self.live_tool = (f"{tool} {preview}" if preview else tool) if tool else self.live_tool
+		else:
+			self.live_tool = None
 
 	def _mark_dead(self) -> None:
 		self.status = "dead"
@@ -242,7 +258,7 @@ class AgentHandle:
 			settle = self._sync.wait_settled(
 				timeout if timeout is not None else _settle_timeout_default(),
 				poll=poll,
-				on_tick=self._absorb_from_state,
+				on_tick=self._tick_sync,
 			)
 		finally:
 			self.awaited = False
@@ -323,6 +339,14 @@ class AgentHandle:
 		except Exception:
 			pass
 			pass
+
+	def _tick_sync(self, state: dict) -> None:
+		self._absorb_from_state(state)
+		REGISTRY.emit()
+
+	async def _tick_async(self, state: dict) -> None:
+		await self._absorb_from_state_async(state)
+		REGISTRY.emit()
 
 	def _absorb_ctx(self, state: dict | None) -> None:
 		context = (state or {}).get("context")
@@ -492,14 +516,12 @@ def spawn_pi_window_handle(
 
 # Grouping (viewer support): the orchestrating agent labels phases before
 # spawning; agents spawned under a phase are grouped under it in the PTC viewer.
-_current_phase: str | None = None
+# Phase state (label + start time) lives on the registry.
 
 
 def current_phase() -> str | None:
-	return _current_phase
+	return REGISTRY.current_phase()
 
 
 def set_phase(label: str | None) -> None:
-	global _current_phase
-	_current_phase = label
-	REGISTRY.emit()
+	REGISTRY.set_phase(label)

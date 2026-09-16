@@ -27,6 +27,9 @@ class Registry:
 	def __init__(self) -> None:
 		self._handles: dict[str, "AgentHandle"] = {}
 		self._lock = threading.Lock()
+		self._phase: str | None = None
+		self._phase_started_at: float | None = None
+		self._last_fingerprint: str | None = None
 
 	def register(self, handle: "AgentHandle") -> None:
 		with self._lock:
@@ -40,6 +43,17 @@ class Registry:
 		with self._lock:
 			return self._handles.get(handle_id)
 
+	def set_phase(self, label: str | None) -> None:
+		"""Label the current orchestration phase (viewer grouping)."""
+		with self._lock:
+			self._phase = label
+			self._phase_started_at = time.time() * 1000 if label else None
+		self.emit()
+
+	def current_phase(self) -> str | None:
+		with self._lock:
+			return self._phase
+
 	def snapshot(self) -> dict:
 		with self._lock:
 			agents = [handle.agent_state() for handle in self._handles.values()]
@@ -51,18 +65,24 @@ class Registry:
 			"depth": _depth_int(),
 			"agents": agents,
 			"totals": {"running": running, "settled": settled, "failed": failed},
+			"groups": {self._phase: self._phase_started_at} if self._phase else {},
 			"timestamp": time.time() * 1000,
 		}
 
-	def emit(self) -> None:
+	def emit(self, force: bool = False) -> None:
+		snapshot = self.snapshot()
+		fingerprint = repr(sorted((a["id"], a["status"], a["toolCalls"], a["thinkingMs"], a["label"], a["awaited"], a["ctx"], a["group"]) for a in snapshot["agents"]))
+		if not force and fingerprint == self._last_fingerprint:
+			return  # nothing changed; skip standalone print and bridge push
+		self._last_fingerprint = fingerprint
 		bridge = _ptc_bridge()
 		if bridge is not None:
 			try:
-				bridge(self.snapshot())
+				bridge(snapshot)
 				return
 			except Exception:
 				pass  # never let UI plumbing break agent control flow
-		emit_status_line(self.snapshot())
+		emit_status_line(snapshot)
 
 
 def _depth_int() -> int:
