@@ -209,39 +209,42 @@ class AgentHandle:
 
 	# -- waiting ------------------------------------------------------------
 
-	def wait(self, timeout: float | None = None) -> Any:
+	def wait(self, timeout: float | None = None, poll: float = 1.0) -> Any:
 		"""Block until the agent settles; returns AgentStrResponse/AgentDictResponse."""
 		if self.closed and self.status != "settled":
 			raise ValueError("await on closed handle (it was aborted; call resume() first)")
 		if self.settled_data is not None:
 			return self._response()
-		if self.status == "starting":
-			# window spawned; pi may still be booting — the socket appears when
-			# the session starts. wait_settled treats missing sockets as dead,
-			# so poll for the socket to appear first.
+		if self.socket_path and not os.path.exists(self.socket_path):
+			# pi may still be booting — the socket appears when the session
+			# starts. wait_settled treats missing sockets as dead, so wait for
+			# the socket to appear first.
 			if not self._await_socket(self.socket_path, timeout):
-				self.status = "failed"
-				REGISTRY.emit()
+				self._mark_dead()
 				raise TimeoutError(f"subagent {self.name}: pi-sock socket never appeared")
 		settle = self._sync.wait_settled(
 			timeout if timeout is not None else _settle_timeout_default(),
+			poll=poll,
 			on_tick=self._absorb_from_state,
 		)
 		return self._finish_wait(settle)
 
-	async def wait_async(self, timeout: float | None = None) -> Any:
+	async def wait_async(self, timeout: float | None = None, poll: float = 1.0) -> Any:
 		if self.closed and self.status != "settled":
 			raise ValueError("await on closed handle (it was aborted; call resume_async() first)")
 		if self.settled_data is not None:
 			return self._response()
-		if self.status == "starting":
-			if not await self._await_socket_async():
-				self.status = "failed"
-				REGISTRY.emit()
+		if self.socket_path and not os.path.exists(self.socket_path):
+			# pi may still be booting — the socket appears when the session
+			# starts. wait_settled treats missing sockets as dead, so wait for
+			# the socket to appear first.
+			if not self._await_socket(self.socket_path, timeout):
+				self._mark_dead()
 				raise TimeoutError(f"subagent {self.name}: pi-sock socket never appeared")
 		try:
 			settle = await self._async.wait_settled(
 				timeout if timeout is not None else _settle_timeout_default(),
+				poll=poll,
 				on_tick=self._absorb_from_state_async,
 			)
 		except PiSockUnavailable:
