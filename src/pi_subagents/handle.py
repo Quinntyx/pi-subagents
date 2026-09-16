@@ -64,6 +64,12 @@ class AgentHandle:
 		self.label: str | None = None
 		self.tool_calls = 0
 		self.thinking_ms = 0
+		# viewer fields: is an await pending on this handle right now?
+		self.awaited = False
+		# context usage from pi-sock get_state (tokens / limit / percent)
+		self.ctx_tokens: int | None = None
+		self.ctx_limit: int | None = None
+		self.ctx_percent: float | None = None
 		self._session: AgentSession | None = None
 		self._sync = SockClient(f"<unbound:{self.id}>")
 		self._async = AsyncSockClient(f"<unbound:{self.id}>")
@@ -91,6 +97,12 @@ class AgentHandle:
 			"thinkingMs": self.thinking_ms,
 			"phase": self.phase,
 			"label": self.label,
+			"awaited": self.awaited,
+			"ctx": {
+				"tokens": self.ctx_tokens,
+				"limit": self.ctx_limit,
+				"percent": self.ctx_percent,
+			} if self.ctx_tokens is not None else None,
 			"depth": int(os.environ.get("PI_SUBAGENTS_MAX_DEPTH", "0") or 0) or None,
 		}
 
@@ -224,11 +236,17 @@ class AgentHandle:
 			if not self._await_socket(self.socket_path, timeout):
 				self._mark_dead()
 				raise TimeoutError(f"subagent {self.name}: pi-sock socket never appeared")
-		settle = self._sync.wait_settled(
-			timeout if timeout is not None else _settle_timeout_default(),
-			poll=poll,
-			on_tick=self._absorb_from_state,
-		)
+		self.awaited = True
+		REGISTRY.emit()
+		try:
+			settle = self._sync.wait_settled(
+				timeout if timeout is not None else _settle_timeout_default(),
+				poll=poll,
+				on_tick=self._absorb_from_state,
+			)
+		finally:
+			self.awaited = False
+			REGISTRY.emit()
 		return self._finish_wait(settle)
 
 	async def wait_async(self, timeout: float | None = None, poll: float = 1.0) -> Any:
@@ -243,6 +261,8 @@ class AgentHandle:
 			if not self._await_socket(self.socket_path, timeout):
 				self._mark_dead()
 				raise TimeoutError(f"subagent {self.name}: pi-sock socket never appeared")
+		self.awaited = True
+		REGISTRY.emit()
 		try:
 			settle = await self._async.wait_settled(
 				timeout if timeout is not None else _settle_timeout_default(),
@@ -252,6 +272,9 @@ class AgentHandle:
 		except PiSockUnavailable:
 			self._mark_dead()
 			raise
+		finally:
+			self.awaited = False
+			REGISTRY.emit()
 		return self._finish_wait(settle)
 
 	def __await__(self):
@@ -285,17 +308,30 @@ class AgentHandle:
 			await asyncio.sleep(0.25)
 		return False
 
-	def _absorb_from_state(self, _state: dict) -> None:
+	def _absorb_from_state(self, state: dict | None = None) -> None:
+		self._absorb_ctx(state)
 		try:
 			self.activity()
 		except Exception:
 			pass
+			pass
 
-	async def _absorb_from_state_async(self, _state: dict) -> None:
+	async def _absorb_from_state_async(self, state: dict | None = None) -> None:
+		self._absorb_ctx(state)
 		try:
 			await self.activity_async()
 		except Exception:
 			pass
+			pass
+
+	def _absorb_ctx(self, state: dict | None) -> None:
+		context = (state or {}).get("context")
+		if isinstance(context, dict):
+			tokens = context.get("tokens")
+			if tokens is not None:
+				self.ctx_tokens = tokens
+				self.ctx_limit = context.get("limit") or context.get("contextWindow")
+				self.ctx_percent = context.get("percent")
 
 	def _finish_wait(self, settle: dict | None) -> Any:
 		if settle is None:
