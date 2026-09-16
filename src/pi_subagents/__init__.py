@@ -29,6 +29,7 @@ __all__ = [
 	"AgentDictResponse",
 	"SchemaValidationError",
 	"list_agents",
+	"phase",
 	"wait_all",
 	"wait_all_async",
 	"stop_all",
@@ -94,6 +95,15 @@ def agent(
 
 # Alias for familiarity with Claude-style APIs.
 spawn = agent
+
+
+def phase(label: str | None) -> None:
+	"""Label the current orchestration phase. Subagents spawned after this call
+	are grouped under `label` in the PTC live viewer. Pass None to close the
+	current phase (subsequent spawns get no group)."""
+	from .handle import set_phase
+
+	set_phase(label)
 
 
 def list_agents() -> list[dict]:

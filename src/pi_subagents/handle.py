@@ -55,6 +55,7 @@ class AgentHandle:
 		self.started_at = time.time() * 1000
 		self.status = "starting"
 		self.closed = False
+		self.group = None
 		self.settled_data: dict | None = None
 		self.window_id: str | None = None
 		self.socket_path: str | None = None
@@ -80,6 +81,7 @@ class AgentHandle:
 		return {
 			"id": self.id,
 			"name": self.name,
+			"group": self.group,
 			"status": self.status,
 			"startedAt": self.started_at,
 			"elapsedMs": round(elapsed),
@@ -446,6 +448,22 @@ def spawn_pi_window_handle(
 		socket_name=handle.id,
 		depth=depth,
 	)
+	handle.group = current_phase()
 	handle._bind(window_ref)
 	REGISTRY.register(handle)
 	return handle
+
+
+# Grouping (viewer support): the orchestrating agent labels phases before
+# spawning; agents spawned under a phase are grouped under it in the PTC viewer.
+_current_phase: str | None = None
+
+
+def current_phase() -> str | None:
+	return _current_phase
+
+
+def set_phase(label: str | None) -> None:
+	global _current_phase
+	_current_phase = label
+	REGISTRY.emit()
