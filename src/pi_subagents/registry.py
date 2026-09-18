@@ -71,17 +71,20 @@ class Registry:
 
 	def emit(self, force: bool = False) -> None:
 		snapshot = self.snapshot()
-		fingerprint = repr(sorted((a["id"], a["status"], a["toolCalls"], a["thinkingMs"], a["label"], a["awaited"], a["ctx"], a["group"]) for a in snapshot["agents"]))
-		if not force and fingerprint == self._last_fingerprint:
-			return  # nothing changed; skip standalone print and bridge push
-		self._last_fingerprint = fingerprint
 		bridge = _ptc_bridge()
 		if bridge is not None:
+			# In a PTC session every tick is forwarded: the frames double as
+			# liveness signals (the host's idle timeout is re-armed on them) and
+			# as animation fuel for the live viewer. Unchanged snapshots are cheap.
 			try:
 				bridge(snapshot)
 				return
 			except Exception:
 				pass  # never let UI plumbing break agent control flow
+		fingerprint = repr(sorted((a["id"], a["status"], a["toolCalls"], a["thinkingMs"], a["label"], a["awaited"], a["ctx"], a["group"]) for a in snapshot["agents"]))
+		if not force and fingerprint == self._last_fingerprint:
+			return  # nothing changed; skip the standalone print
+		self._last_fingerprint = fingerprint
 		emit_status_line(snapshot)
 
 
