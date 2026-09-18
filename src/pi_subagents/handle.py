@@ -283,7 +283,7 @@ class AgentHandle:
 			settle = await self._async.wait_settled(
 				timeout if timeout is not None else _settle_timeout_default(),
 				poll=poll,
-				on_tick=self._absorb_from_state_async,
+				on_tick=self._tick_async,
 			)
 		except PiSockUnavailable:
 			self._mark_dead()

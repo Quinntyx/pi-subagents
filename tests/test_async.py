@@ -98,3 +98,72 @@ def test_resume_async_reopens(tmp_path):
 			server.close()
 
 	asyncio.run(run())
+
+
+def test_wait_paths_emit_bridge_frames_each_tick(tmp_path, monkeypatch):
+	"""Both wait paths must push a snapshot every poll tick.
+
+	The PTC host re-arms its idle timeout on those frames, so a wait that stops
+	emitting looks like a hung session and gets killed.
+	"""
+	import builtins
+
+	frames = []
+	monkeypatch.setattr(builtins, "PTC_STATE_EMIT", lambda snap: frames.append(snap), raising=False)
+
+	async def run_async():
+		h = AgentHandle("p", name="tick-a", cwd=str(tmp_path), window_name="tick-a", model=None, thinking=None, schema=None)
+		server = bind_handle(h, tmp_path)
+		states = iter([
+			{"isIdle": False, "hasPendingMessages": False},
+			{"isIdle": False, "hasPendingMessages": False},
+			{"isIdle": False, "hasPendingMessages": False},
+			{"isIdle": False, "hasPendingMessages": False},
+			{"isIdle": False, "hasPendingMessages": False},
+		])
+
+		def _state():
+			try:
+				return next(states)
+			except StopIteration:
+				return {"isIdle": True, "hasPendingMessages": False}
+
+		server.behaviors["state"] = _state
+		server.behaviors["message"] = {"content": "done", "timestamp": 1}
+		try:
+			before = len(frames)
+			resp = await h.wait_async(timeout=8, poll=0.05)
+			assert str(resp) == "done"
+			# One frame per busy tick (plus the settle frame). A wait that only
+			# emits on settle would report 1 and starve the host's idle timer.
+			assert len(frames) - before >= 4, f"expected per-tick bridge frames, got {len(frames) - before}"
+		finally:
+			server.close()
+
+	asyncio.run(run_async())
+
+	frames.clear()
+	h = AgentHandle("p", name="tick-s", cwd=str(tmp_path), window_name="tick-s", model=None, thinking=None, schema=None)
+	server = bind_handle(h, tmp_path)
+	states = iter([
+		{"isIdle": False, "hasPendingMessages": False},
+		{"isIdle": False, "hasPendingMessages": False},
+		{"isIdle": False, "hasPendingMessages": False},
+		{"isIdle": False, "hasPendingMessages": False},
+		{"isIdle": False, "hasPendingMessages": False},
+	])
+
+	def _state():
+		try:
+			return next(states)
+		except StopIteration:
+			return {"isIdle": True, "hasPendingMessages": False}
+
+	server.behaviors["state"] = _state
+	server.behaviors["message"] = {"content": "done", "timestamp": 2}
+	try:
+		before = len(frames)
+		assert str(h.wait(timeout=8, poll=0.05)) == "done"
+		assert len(frames) - before >= 4, f"expected per-tick bridge frames, got {len(frames) - before}"
+	finally:
+		server.close()
