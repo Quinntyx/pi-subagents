@@ -31,6 +31,12 @@ import pi_subagents as subagents
 handle = subagents.agent("Analyze the failing tests in tests/ and report root causes",
                          name="test-digger")
 
+# per-subagent model / thinking level (passed to the spawned pi as --model/--thinking)
+reviewer = subagents.agent("Review the diff for correctness", name="reviewer",
+                           model="openai-codex/gpt-6-astra", thinking="high")
+cheap = subagents.agent("Count TODO comments in src/", name="counter",
+                        model="deepseek-router/deepseek-v4.1-flash", thinking="low")
+
 # the agent is a real pi instance in a tmux window: watch it there, or steer it
 await handle.send_async("focus on the auth module first", mode="steer")
 await handle.abort_async()          # "pause": stops the current run
