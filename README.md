@@ -68,6 +68,24 @@ responses = await subagents.wait_all_async([h1, h2, h3], timeout=600)
 subagents.stop_all()
 ```
 
+### Choosing a model (`model=` / `thinking=`)
+
+```python
+caps = subagents.capabilities()        # defaults, providers, thinking levels, caps; no catalog dump
+subagents.thinking_levels()            # ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+subagents.scoped_models()              # the subagent profile's picker set (not a limit on agent(model=))
+subagents.model_slugs("astra")         # every matching `provider/model` slug
+subagents.resolve_models("opus")       # matching ModelInfo rows (context, max output, thinking, images)
+subagents.best_model_match("astra")    # one pick: .slug / .context / .thinking / .images
+```
+
+The catalog is read from `pi --list-models` as seen by the *subagent* profile, so
+it is exactly what a spawned instance can resolve (610 models across 9 providers
+on the author's machine). `best_model_match` prefers an exact slug, then the
+profile's own default provider, then first-party entries over proxied ones;
+it returns `None` when nothing genuinely matches (the CLI search is fuzzy and
+returns unrelated neighbours, which the helper filters out).
+
 ### Sync vs async
 
 Plain scripts use the sync surface: `handle.wait(timeout=...)`, `handle.send(text)`,

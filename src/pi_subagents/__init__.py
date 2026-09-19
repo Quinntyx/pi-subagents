@@ -14,6 +14,16 @@ Environment contract (checked at import):
   warning; every API call raises ``NotImplementedError``.
 """
 
+from .catalog import (
+	best_model_match,
+	capabilities,
+	list_models,
+	model_slugs,
+	profile_defaults,
+	resolve_models,
+	scoped_models,
+	thinking_levels,
+)
 from .envcheck import ensure_environment
 from .registry import REGISTRY, emit_status_line
 from .handle import AgentHandle
@@ -23,6 +33,14 @@ from .response import AgentDictResponse, AgentStrResponse
 
 __all__ = [
 	"agent",
+	"capabilities",
+	"list_models",
+	"model_slugs",
+	"resolve_models",
+	"best_model_match",
+	"thinking_levels",
+	"profile_defaults",
+	"scoped_models",
 	"AgentHandle",
 	"AgentSession",
 	"AgentStrResponse",
