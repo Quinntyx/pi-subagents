@@ -65,7 +65,13 @@ await handle                          # wait again
 
 # fan-out helpers
 responses = await subagents.wait_all_async([h1, h2, h3], timeout=600)
-subagents.stop_all()
+
+# close subagents permanently once their work is done and no resume/steer/history
+# inspection is needed — this is what keeps tmux windows from piling up
+subagents.finish()               # close everything this session spawned
+subagents.finish([h1, h2])       # or just these handles; h.kill() is the per-handle form
+subagents.stop_all()             # abort every run (windows stay open)
+subagents.list()                 # snapshot rows for every spawned agent
 ```
 
 ### Choosing a model (`model=` / `thinking=`)
