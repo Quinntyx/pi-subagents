@@ -18,6 +18,19 @@ if TYPE_CHECKING:  # pragma: no cover
 	from .handle import AgentHandle
 
 
+def current_exec_scope() -> str | None:
+	"""Exec token of the PTC chunk that is currently running.
+
+	Set by the session runtime as ``builtins.PTC_EXEC_SCOPE`` for the duration of
+	each chunk, so agents registered while it runs are attributed to it. The host's
+	viewer then renders only the agents of the exec it is streaming, which keeps
+	older settled batches (from earlier chunks in the same long-lived interpreter)
+	out of the current view.
+	"""
+	token = getattr(builtins, "PTC_EXEC_SCOPE", None)
+	return token if isinstance(token, str) and token else None
+
+
 def _ptc_bridge():
 	bridge = getattr(builtins, "PTC_STATE_EMIT", None)
 	return bridge if callable(bridge) else None

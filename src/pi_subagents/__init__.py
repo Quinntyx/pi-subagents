@@ -51,6 +51,7 @@ __all__ = [
 	"wait_all",
 	"wait_all_async",
 	"stop_all",
+	"finish",
 	"PiSubagentsError",
 	"PiSubagentsTimeoutError",
 	"NotImplementedError",
@@ -157,12 +158,33 @@ async def wait_all_async(handles: list, timeout: float | None = None) -> list:
 
 
 def stop_all() -> None:
-	"""Abort every subagent spawned by this process."""
+	"""Abort every subagent spawned by this process (runs stop; windows stay)."""
 	for handle in REGISTRY.handles():
 		try:
 			handle.abort()
 		except Exception:
 			pass
+
+
+def finish(handles: list | None = None) -> int:
+	"""Close subagents permanently: kill their tmux windows and clean their sockets.
+
+	Call this once a fan-out's results are in and the agents do not need to be
+	resumed, steered, or inspected further — leaving them running is what produces
+	orphaned tmux windows.
+
+	With `handles=None` (the default), every subagent spawned by this process is
+	closed. Returns the number of handles closed. Safe to call twice.
+	"""
+	targets = handles if handles is not None else REGISTRY.handles()
+	closed = 0
+	for handle in targets:
+		try:
+			handle.kill()
+			closed += 1
+		except Exception:
+			pass
+	return closed
 
 
 def emit_status_line() -> None:  # re-exported for the runtime bridge tests

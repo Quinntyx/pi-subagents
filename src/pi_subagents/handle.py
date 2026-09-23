@@ -53,9 +53,18 @@ class AgentHandle:
 		self.thinking = thinking
 		self.schema = schema
 		self.started_at = time.time() * 1000
+		# Frozen at the moment the agent stops running, so a settled row shows its
+		# actual runtime instead of growing forever with the age of the handle.
+		runtime_ms: int | None = None
+		self.runtime_ms = runtime_ms
 		self.status = "starting"
 		self.closed = False
 		self.group = None
+		# Exec this agent was spawned in (the session runtime stamps the current
+		# exec id into builtins.PTC_EXEC_SCOPE); the host's viewer scopes by it.
+		from .registry import current_exec_scope
+
+		self.exec_scope = current_exec_scope()
 		self.settled_data: dict | None = None
 		self.window_id: str | None = None
 		self.socket_path: str | None = None
@@ -84,14 +93,22 @@ class AgentHandle:
 		self._async = AsyncSockClient(window_ref.socket_path)
 		self.status = "running"
 
+	def _stamp_runtime(self) -> None:
+		"""Freeze the runtime the moment the agent stops running."""
+		if self.runtime_ms is None:
+			self.runtime_ms = round((time.time() * 1000) - self.started_at)
+
 	def agent_state(self) -> dict:
 		"""Compact snapshot row for the registry."""
-		elapsed = (time.time() * 1000) - self.started_at
+		elapsed = self.runtime_ms
+		if elapsed is None:
+			elapsed = round((time.time() * 1000) - self.started_at)
 		return {
 			"id": self.id,
 			"name": self.name,
 			"group": self.group,
 			"status": self.status,
+			"execScope": self.exec_scope,
 			"startedAt": self.started_at,
 			"elapsedMs": round(elapsed),
 			"socketPath": self.socket_path,
@@ -129,6 +146,7 @@ class AgentHandle:
 			self._mark_dead()
 			return {"aborted": False, "dead": True}
 		self.status = "stopped"
+		self._stamp_runtime()
 		self.closed = True
 		REGISTRY.emit()
 		return result
@@ -140,6 +158,7 @@ class AgentHandle:
 			self._mark_dead()
 			return {"aborted": False, "dead": True}
 		self.status = "stopped"
+		self._stamp_runtime()
 		self.closed = True
 		REGISTRY.emit()
 		return result
@@ -178,7 +197,13 @@ class AgentHandle:
 		return self
 
 	def kill(self) -> None:
-		"""Abort and tear down the tmux window."""
+		"""Close the subagent permanently: abort the run and destroy its tmux window.
+
+		Call once the work is done and there is no need to resume, steer, or read the
+		session history again — this is what keeps long sessions from accumulating
+		orphaned tmux windows. The handle's status becomes "dead" and the socket file
+		is cleaned up best-effort.
+		"""
 		try:
 			self.abort()
 		except Exception:
@@ -186,6 +211,12 @@ class AgentHandle:
 		if self.window_id:
 			kill_window(self.window_id)
 		self.status = "dead"
+		self._stamp_runtime()
+		try:
+			if self.socket_path and os.path.exists(self.socket_path):
+				os.unlink(self.socket_path)
+		except OSError:
+			pass
 		REGISTRY.emit()
 
 	# -- observation --------------------------------------------------------
@@ -231,6 +262,7 @@ class AgentHandle:
 
 	def _mark_dead(self) -> None:
 		self.status = "dead"
+		self._stamp_runtime()
 		self.closed = True
 		REGISTRY.emit()
 
@@ -363,11 +395,13 @@ class AgentHandle:
 				self._mark_dead()
 				raise TimeoutError(f"subagent {self.name}: pi process died before settling")
 			self.status = "failed"
+			self._stamp_runtime()
 			REGISTRY.emit()
 			raise TimeoutError(f"subagent {self.name}: settle timeout exceeded")
 		self._absorb_from_state(settle)
 		self.settled_data = settle
 		self.status = "settled"
+		self._stamp_runtime()
 		REGISTRY.emit()
 		return self._response()
 
