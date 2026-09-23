@@ -527,6 +527,7 @@ def spawn_pi_window_handle(
 	model: str | None = None,
 	thinking: str | None = None,
 	schema: dict | None = None,
+	profile: str | os.PathLike[str] | None = None,
 ) -> AgentHandle:
 	"""Spawn a pi window and return its AgentHandle (used by subagents.agent)."""
 	depth = int(os.environ.get("PI_SUBAGENT_DEPTH", "0") or 0) + 1
@@ -553,6 +554,7 @@ def spawn_pi_window_handle(
 		thinking=handle.thinking,
 		socket_name=handle.id,
 		depth=depth,
+		profile=profile,
 	)
 	handle.group = current_phase()
 	handle._bind(window_ref)

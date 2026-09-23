@@ -13,11 +13,30 @@ from pathlib import Path
 from .envcheck import require_environment, tmux
 
 SOCK_DIR = Path.home() / ".pi" / "pi-sock"
-DEFAULT_PROFILE = Path.home() / ".config" / "pi" / "profiles" / "subagents"
+PROFILES_ROOT = Path.home() / ".config" / "pi" / "profiles"
+DEFAULT_PROFILE = PROFILES_ROOT / "subagents"
 
 
 def subagent_profile_dir() -> Path:
 	return Path(os.environ.get("PI_SUBAGENTS_PROFILE", str(DEFAULT_PROFILE)))
+
+
+def resolve_profile(profile: str | os.PathLike[str] | None) -> Path:
+	"""Resolve a profile kwarg to a pi profile directory.
+
+	None → the default subagent profile (PI_SUBAGENTS_PROFILE or subagents).
+	A bare name → ~/.config/pi/profiles/<name>; an absolute/relative path →
+	that directory. Raises when the directory does not exist.
+	"""
+	if profile is None:
+		candidate = subagent_profile_dir()
+	else:
+		candidate = Path(profile)
+		if not candidate.is_absolute() and "/" not in str(profile) and "\\" not in str(profile):
+			candidate = PROFILES_ROOT / profile
+	if not candidate.is_dir():
+		raise RuntimeError(f"subagent pi profile not found: {candidate}")
+	return candidate
 
 
 def socket_dir() -> Path:
@@ -59,16 +78,17 @@ def spawn_pi_window(
 	thinking: str | None,
 	socket_name: str,
 	depth: int,
+	profile: str | os.PathLike[str] | None = None,
 ) -> "WindowRef":
 	"""Create a tmux window running an interactive pi instance with a prompt.
 
 	Returns a WindowRef (window id + socket path). Raises on tmux failure.
+	`profile` selects the pi profile: a name under ~/.config/pi/profiles or a
+	path; None → the default subagent profile.
 	"""
 	placement = require_environment()
 	sock_path = socket_dir() / f"{socket_name}.sock"
-	profile = subagent_profile_dir()
-	if not profile.is_dir():
-		raise RuntimeError(f"subagent pi profile not found: {profile}")
+	profile_dir = resolve_profile(profile)
 
 	pi_cmd = _build_pi_command(prompt, model=model, thinking=thinking)
 	args = [
@@ -82,7 +102,7 @@ def spawn_pi_window(
 		"-n",
 		window_name,
 		"-e",
-		f"PI_CODING_AGENT_DIR={profile}",
+		f"PI_CODING_AGENT_DIR={profile_dir}",
 		"-e",
 		f"PI_SOCK_NAME={socket_name}",
 		"-e",

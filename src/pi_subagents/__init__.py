@@ -25,6 +25,7 @@ from .catalog import (
 	thinking_levels,
 )
 from .envcheck import ensure_environment
+import os
 from .registry import REGISTRY, emit_status_line
 from .handle import AgentHandle
 from .schema import SchemaValidationError
@@ -89,12 +90,19 @@ def agent(
 	model: str | None = None,
 	thinking: str | None = None,
 	schema: dict | None = None,
+	profile: str | os.PathLike[str] | None = None,
 ) -> AgentHandle:
 	"""Spawn a subagent pi in a new tmux window and return its handle immediately.
 
 	The handle can be awaited (``resp = await handle``) to get an
 	AgentStrResponse/AgentDictResponse, or driven interactively with
 	``send``/``abort``/``resume`` while it runs.
+
+	``profile`` selects the pi profile the agent runs under: a profile name
+	under ``~/.config/pi/profiles`` (e.g. ``"design-subagents"``), a path to a
+	profile directory, or None for the default ``subagents`` profile. This is
+	how special-purpose subagent profiles (extra extensions, system prompts,
+	skills) are selected per spawn without env-var juggling.
 	"""
 	from .handle import spawn_pi_window_handle
 
@@ -107,6 +115,7 @@ def agent(
 		model=model,
 		thinking=thinking,
 		schema=schema,
+		profile=profile,
 	)
 	REGISTRY.emit()
 	return handle
