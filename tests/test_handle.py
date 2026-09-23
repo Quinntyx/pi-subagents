@@ -239,6 +239,19 @@ def test_session_jsonl_trajectory(tmp_path):
 		server.close()
 
 
+def test_agent_handle_str_shows_result_or_status(tmp_path):
+	h = AgentHandle("p", name="st", cwd=str(tmp_path), window_name="st", model=None, thinking=None, schema=None)
+	server = bind_handle(h, tmp_path)
+	server.behaviors["state"] = {"isIdle": False, "hasPendingMessages": False}
+	try:
+		assert "status=running" in str(h)
+		assert "AgentHandle object at" not in repr(h)
+		h.settled_data = {"lastAssistant": {"content": "the reply", "timestamp": 1}}
+		assert str(h) == "the reply"
+	finally:
+		server.close()
+
+
 def test_str_response_plain_string_semantics(tmp_path):
 	h = AgentHandle("p", name="t13", cwd=str(tmp_path), window_name="t13", model=None, thinking=None, schema=None)
 	server = bind_handle(h, tmp_path)

@@ -325,6 +325,18 @@ class AgentHandle:
 			REGISTRY.emit()
 		return self._finish_wait(settle)
 
+	def __str__(self) -> str:
+		"""The settled response text once available, otherwise a status line."""
+		if self.settled_data is not None:
+			last = (self.settled_data or {}).get("lastAssistant") or {}
+			text = last.get("content") if isinstance(last, dict) else None
+			if text:
+				return str(text)
+		return f"<AgentHandle {self.name!r} status={self.status}>"
+
+	def __repr__(self) -> str:
+		return self.__str__()
+
 	def __await__(self):
 		return self.wait_async().__await__()
 
