@@ -85,6 +85,16 @@ subagents.resolve_models("opus")       # matching ModelInfo rows (context, max o
 subagents.best_model_match("astra")    # one pick: .slug / .context / .thinking / .images
 ```
 
+### Choosing a profile (`profile=`)
+
+```python
+# Special-purpose subagent profiles: extra extensions / system prompts / skills.
+# Default is "subagents"; bare names resolve under ~/.config/pi/profiles,
+# explicit paths also work.
+designer = subagents.agent("Design a checkout flow mock", name="designer",
+                           profile="design-subagents", cwd="./mock")
+```
+
 The catalog is read from `pi --list-models` as seen by the *subagent* profile, so
 it is exactly what a spawned instance can resolve (610 models across 9 providers
 on the author's machine). `best_model_match` prefers an exact slug, then the
