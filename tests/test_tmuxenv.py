@@ -39,6 +39,19 @@ def test_build_pi_command_never_embeds_the_prompt(monkeypatch):
 	assert len(command) < 100
 
 
+def test_subagent_session_name_marks_the_pane_title(monkeypatch):
+	"""pi's title is "π - [<name> - ]<cwd>"; the name marks it as a subagent."""
+	import shlex
+
+	assert tmuxenv.subagent_session_name("test-digger") == "(subagent) test-digger"
+	assert tmuxenv.subagent_session_name("") == "(subagent) subagent"
+
+	monkeypatch.setattr(tmuxenv.shutil, "which", lambda name: "pi")
+	command = tmuxenv._build_pi_command("p", model=None, thinking=None, session_name=tmuxenv.subagent_session_name("a b"))
+	# the name is quoted as a single argv element even with a space in it
+	assert shlex.split(command) == ["pi", "--name", "(subagent) a b"]
+
+
 def test_max_concurrent_env(monkeypatch):
 	monkeypatch.setenv("PI_SUBAGENTS_MAX_CONCURRENT", "3")
 	assert tmuxenv.max_concurrent() == 3

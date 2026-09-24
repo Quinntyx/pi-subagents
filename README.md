@@ -117,6 +117,15 @@ later (they still spawned fine via `model=`). A lookup that finds nothing is ret
 against the live catalog before `None` is returned, and `refresh=True` bypasses the
 cache entirely.
 
+## Identifying subagents in the tmux overview
+
+Every subagent window is launched with `pi --name "(subagent) <name>"`, so pi's
+own terminal title — the string tmux's overview shows — marks the process:
+`π - (subagent) test-digger - Vault`, against a main agent's `π - Vault`. The
+tmux window keeps the short agent name, and the named session also shows up that
+way in pi's own session picker. (pi composes the title as
+`π - [<session name> - ]<cwd>`, hence the marker sits before the directory.)
+
 ## The initial prompt travels over pi-sock
 
 The tmux window starts a bare `pi`; the prompt is delivered through pi-sock once the

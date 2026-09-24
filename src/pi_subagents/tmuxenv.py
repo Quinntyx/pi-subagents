@@ -91,7 +91,12 @@ def spawn_pi_window(
 	sock_path = socket_dir() / f"{socket_name}.sock"
 	profile_dir = resolve_profile(profile)
 
-	pi_cmd = _build_pi_command(prompt, model=model, thinking=thinking)
+	pi_cmd = _build_pi_command(
+		prompt,
+		model=model,
+		thinking=thinking,
+		session_name=subagent_session_name(name),
+	)
 	args = [
 		"new-window",
 		"-d",
@@ -126,7 +131,25 @@ def spawn_pi_window(
 	return WindowRef(window_id=window_id, socket_path=str(sock_path), name=name)
 
 
-def _build_pi_command(prompt: str, *, model: str | None, thinking: str | None) -> str:
+def subagent_session_name(name: str) -> str:
+	"""Session display name for a subagent.
+
+	pi composes its terminal/pane title as "π - [<session name> - ]<cwd>", and the
+	tmux overview surfaces exactly that. Passing this as --name makes every
+	subagent identifiable at a glance in a wall of pi windows (and names the
+	session in pi's own session list / --resume picker).
+	"""
+	label = (name or "subagent").strip()
+	return f"(subagent) {label}"
+
+
+def _build_pi_command(
+	prompt: str,
+	*,
+	model: str | None,
+	thinking: str | None,
+	session_name: str | None = None,
+) -> str:
 	"""Command for the tmux window.
 
 	The prompt is deliberately NOT part of this command: it is delivered over
@@ -134,9 +157,13 @@ def _build_pi_command(prompt: str, *, model: str | None, thinking: str | None) -
 	worked only up to tmux/OS argv limits — beyond that it was silently
 	truncated mid-string (which surfaced as a bizarre quoting error, since the
 	closing quote never arrived).
+
+	`session_name` becomes pi's --name, which drives the pane title.
 	"""
 	pi = shutil.which("pi") or "pi"
 	parts = [shlex.quote(pi)]
+	if session_name:
+		parts += ["--name", shlex.quote(session_name)]
 	if model:
 		parts += ["--model", shlex.quote(model)]
 	if thinking:
