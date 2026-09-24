@@ -13,6 +13,12 @@ in the TUI and intervene at any time.
 uv pip install --editable ~/docs/src/pi-subagents/main
 ```
 
+Note: since pi-ptc-next's auto-provisioning landed, this install is performed
+automatically at session start — the PTC venv is created if missing and
+pi-subagents is installed editable from your dev checkout (when present) or
+from a managed git clone of this repo (`pi update --extensions` refreshes it).
+The manual command above is only needed for non-PTC use.
+
 ## Environment contract (checked at import)
 
 - `PI_SUBAGENT_DEPTH` set → `import pi_subagents` raises `NotImplementedError`.
