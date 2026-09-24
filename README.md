@@ -101,12 +101,34 @@ designer = subagents.agent("Design a checkout flow mock", name="designer",
                            profile="design-subagents", cwd="./mock")
 ```
 
-The catalog is read from `pi --list-models` as seen by the *subagent* profile, so
-it is exactly what a spawned instance can resolve (610 models across 9 providers
-on the author's machine). `best_model_match` prefers an exact slug, then the
-profile's own default provider, then first-party entries over proxied ones;
-it returns `None` when nothing genuinely matches (the CLI search is fuzzy and
-returns unrelated neighbours, which the helper filters out).
+The catalog is read from `pi --list-models` as seen by the subagent's pi profile, so
+it is exactly what a spawned instance can resolve (610 models across 9 providers on
+the author's machine). `best_model_match` prefers an exact slug, then the profile's
+own default provider, then first-party entries over proxied ones, breaking
+remaining ties in catalog order; it returns `None` when nothing genuinely matches
+(the CLI search is fuzzy and returns unrelated neighbours, which the helper filters
+out). Pass a full `provider/model` slug when a specific provider's variant matters —
+exact slugs always win.
+
+**Freshness.** Results are cached per search term for `PI_SUBAGENTS_CATALOG_TTL`
+seconds (default 120). The cache must expire: the interpreter is long-lived, so an
+unbounded cache froze the catalog for the life of the session and hid models added
+later (they still spawned fine via `model=`). A lookup that finds nothing is retried
+against the live catalog before `None` is returned, and `refresh=True` bypasses the
+cache entirely.
+
+## The initial prompt travels over pi-sock
+
+The tmux window starts a bare `pi`; the prompt is delivered through pi-sock once the
+instance answers `get_state` (pi-sock binds during `session_start`, so a responsive
+socket means the session is up). This keeps prompts out of the `tmux new-window`
+argv, where anything past tmux/OS limits was silently truncated mid-string — the
+lost closing quote made it look like a quoting bug, and a 200 KB prompt could not be
+spawned at all. `spawn()` therefore returns immediately with the handle in
+`starting`; every control method (`send`/`state`/`activity`/`wait`/`resume`) waits
+for that first delivery, so a `send()` right after `agent()` can never overtake the
+initial prompt; and a subagent whose pi never comes up is killed rather than
+orphaned (`handle.status == "failed"`, and `wait()` explains why).
 
 ### Sync vs async
 
