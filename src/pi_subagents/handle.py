@@ -8,12 +8,15 @@ AgentSession it exposes (the pi session JSONL on disk).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import threading
 import json
 import os
 import time
 from typing import Any
 
 from .client import AsyncSockClient, PiSockError, PiSockUnavailable, SockClient
+from .errors import PiSubagentsError
 from .envcheck import require_environment
 from .registry import REGISTRY
 from .response import AgentDictResponse, AgentStrResponse
@@ -21,6 +24,9 @@ from .schema import SchemaValidationError, validate_schema, validate_with_schema
 from .tmuxenv import kill_window, max_concurrent, spawn_pi_window, unique_socket_name, window_alive
 
 DEFAULT_SETTLE_TIMEOUT = 30 * 60.0
+# How long to wait for a freshly spawned pi to bring its pi-sock socket up and
+# accept the initial prompt over the socket.
+DEFAULT_STARTUP_TIMEOUT = 90.0
 
 
 def _settle_timeout_default() -> float:
@@ -28,6 +34,13 @@ def _settle_timeout_default() -> float:
 		return max(1.0, float(os.environ.get("PI_SUBAGENTS_SETTLE_TIMEOUT", str(DEFAULT_SETTLE_TIMEOUT))))
 	except ValueError:
 		return DEFAULT_SETTLE_TIMEOUT
+
+
+def _startup_timeout() -> float:
+	try:
+		return max(5.0, float(os.environ.get("PI_SUBAGENTS_STARTUP_TIMEOUT", str(DEFAULT_STARTUP_TIMEOUT))))
+	except ValueError:
+		return DEFAULT_STARTUP_TIMEOUT
 
 
 class AgentHandle:
@@ -83,6 +96,13 @@ class AgentHandle:
 		self.ctx_limit: int | None = None
 		self.ctx_percent: float | None = None
 		self._session: AgentSession | None = None
+		# Readiness/delivery of the initial prompt (see _run_startup).
+		self._ready: concurrent.futures.Future = concurrent.futures.Future()
+		self._startup_error: Exception | None = None
+		self._killed = False
+		# True only for instances this library started (and therefore must deliver a
+		# first prompt to). Manually-constructed handles have nothing to wait for.
+		self._startup_started = False
 		self._sync = SockClient(f"<unbound:{self.id}>")
 		self._async = AsyncSockClient(f"<unbound:{self.id}>")
 
@@ -91,7 +111,81 @@ class AgentHandle:
 		self.socket_path = window_ref.socket_path
 		self._sync = SockClient(window_ref.socket_path)
 		self._async = AsyncSockClient(window_ref.socket_path)
-		self.status = "running"
+		# Still "starting" until the initial prompt has been delivered over pi-sock.
+		self.status = "starting"
+
+	# -- startup: readiness + first prompt over pi-sock -------------------------
+
+	def _await_ready(self, timeout: float | None = None) -> None:
+		"""Block until the initial prompt has been delivered (or startup failed)."""
+		if not self._startup_started:
+			return
+		try:
+			self._ready.result(timeout=timeout if timeout is not None else _startup_timeout() + 5.0)
+		except Exception as error:  # concurrent.futures.TimeoutError
+			raise PiSubagentsError(
+				f"subagent {self.name}: the initial prompt was not delivered within "
+				f"{_startup_timeout():.0f}s (is the subagent pi still starting?)"
+			) from error
+		if self._startup_error is not None:
+			raise PiSubagentsError(
+				f"subagent {self.name}: startup failed: {self._startup_error}"
+			) from self._startup_error
+
+	async def _await_ready_async(self, timeout: float | None = None) -> None:
+		import asyncio
+
+		if not self._startup_started:
+			return
+		loop = asyncio.get_running_loop()
+		await asyncio.wait_for(
+			asyncio.wrap_future(self._ready),
+			timeout=timeout if timeout is not None else _startup_timeout() + 5.0,
+		)
+		if self._startup_error is not None:
+			raise PiSubagentsError(
+				f"subagent {self.name}: startup failed: {self._startup_error}"
+			) from self._startup_error
+
+	def _run_startup(self) -> None:
+		"""Wait for pi-sock, then deliver the initial prompt as the first turn.
+
+		Runs in a daemon thread so spawn() stays instant. The handle's control
+		methods wait on `_ready`, so a follow-up steer can never overtake the
+		initial prompt. A window that never comes up is killed rather than
+		orphaned.
+		"""
+		try:
+			deadline = time.monotonic() + _startup_timeout()
+			while True:
+				if self._killed:
+					return
+				try:
+					self._sync.state()
+					break  # pi-sock answers: session started, UI is coming up
+				except PiSockUnavailable:
+					if not self.is_window_alive():
+						raise RuntimeError("the subagent's pi process exited before becoming ready")
+					if time.monotonic() >= deadline:
+						raise TimeoutError(f"pi-sock did not answer within {_startup_timeout():.0f}s")
+					time.sleep(0.2)
+			if self._killed:
+				return
+			# pi is idle here, so a plain send triggers the first turn immediately.
+			self._sync.send(self.prompt, mode="steer")
+			self.status = "running"
+		except Exception as error:
+			self._startup_error = error
+			# Never leave a window behind for a subagent we cannot talk to; kill()
+			# marks it dead, so the informative status is restored afterwards.
+			try:
+				self.kill()
+			except Exception:
+				pass
+			self.status = "failed"
+		finally:
+			if not self._ready.done():
+				self._ready.set_result(None)
 
 	def _stamp_runtime(self) -> None:
 		"""Freeze the runtime the moment the agent stops running."""
@@ -133,9 +227,11 @@ class AgentHandle:
 
 	def send(self, text: str, mode: str = "steer") -> dict:
 		"""Steer a running agent (mode="steer") or queue a follow-up."""
+		self._await_ready()
 		return self._sync.send(text, mode=mode)
 
 	async def send_async(self, text: str, mode: str = "steer") -> dict:
+		await self._await_ready_async()
 		return await self._async.send(text, mode)
 
 	def abort(self) -> dict:
@@ -171,6 +267,7 @@ class AgentHandle:
 		"""
 		if not self.closed and self.status not in ("stopped", "failed", "dead", "settled"):
 			raise ValueError("resume on a handle that is still running; abort it first")
+		self._await_ready()
 		self.closed = False
 		self.settled_data = None
 		self.status = "running"
@@ -185,6 +282,7 @@ class AgentHandle:
 	async def resume_async(self, prompt: str | None = None) -> "AgentHandle":
 		if not self.closed and self.status not in ("stopped", "failed", "dead", "settled"):
 			raise ValueError("resume on a handle that is still running; abort it first")
+		await self._await_ready_async()
 		self.closed = False
 		self.settled_data = None
 		self.status = "running"
@@ -204,6 +302,7 @@ class AgentHandle:
 		orphaned tmux windows. The handle's status becomes "dead" and the socket file
 		is cleaned up best-effort.
 		"""
+		self._killed = True
 		try:
 			self.abort()
 		except Exception:
@@ -222,13 +321,16 @@ class AgentHandle:
 	# -- observation --------------------------------------------------------
 
 	def state(self) -> dict:
+		self._await_ready()
 		return self._sync.state()
 
 	async def state_async(self) -> dict:
+		await self._await_ready_async()
 		return await self._async.state()
 
 	def activity(self) -> dict | None:
 		"""Latest pi-tool-tree snapshot (None when the relay is unavailable)."""
+		self._await_ready()
 		snap = self._sync.activity()
 		if snap and snap.get("available"):
 			self._absorb_activity(snap)
@@ -236,6 +338,7 @@ class AgentHandle:
 		return None
 
 	async def activity_async(self) -> dict | None:
+		await self._await_ready_async()
 		snap = await self._async.activity()
 		if snap and snap.get("available"):
 			self._absorb_activity(snap)
@@ -273,6 +376,8 @@ class AgentHandle:
 
 	def wait(self, timeout: float | None = None, poll: float = 1.0) -> Any:
 		"""Block until the agent settles; returns AgentStrResponse/AgentDictResponse."""
+		# A failed startup explains itself before the closed-handle check.
+		self._await_ready()
 		if self.closed and self.status != "settled":
 			raise ValueError("await on closed handle (it was aborted; call resume() first)")
 		if self.settled_data is not None:
@@ -298,6 +403,8 @@ class AgentHandle:
 		return self._finish_wait(settle)
 
 	async def wait_async(self, timeout: float | None = None, poll: float = 1.0) -> Any:
+		# A failed startup explains itself before the closed-handle check.
+		await self._await_ready_async()
 		if self.closed and self.status != "settled":
 			raise ValueError("await on closed handle (it was aborted; call resume_async() first)")
 		if self.settled_data is not None:
@@ -559,6 +666,10 @@ def spawn_pi_window_handle(
 	handle.group = current_phase()
 	handle._bind(window_ref)
 	REGISTRY.register(handle)
+	# Deliver the initial prompt over pi-sock once the instance is ready.
+	handle._startup_started = True
+	threading.Thread(target=handle._run_startup, name=f"subagent-startup-{handle.id}", daemon=True).start()
+	REGISTRY.emit()
 	return handle
 
 

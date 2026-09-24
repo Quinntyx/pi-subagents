@@ -23,12 +23,20 @@ def test_unique_socket_name_prefix_and_fallback(tmp_path, monkeypatch):
 
 
 def test_quote_for_tmux_shell(monkeypatch):
-	monkeypatch.setattr(tmuxenv.shutil, "which", lambda name: "pi")
+	import shlex
+
 	quoted = tmuxenv._quote_for_tmux_shell("it's a 'quoted' string")
-	assert quoted == "'it'\\''s a '\\''quoted'\\'' string'"
-	command = tmuxenv._build_pi_command("hello world", model="deepseek-router/deepseek-v4.1-flash", thinking="high")
-	assert command.startswith("pi --model deepseek-router/deepseek-v4.1-flash --thinking high")
-	assert command.endswith("'hello world'")
+	assert shlex.split(quoted) == ["it's a 'quoted' string"]
+
+
+def test_build_pi_command_never_embeds_the_prompt(monkeypatch):
+	"""The prompt goes over pi-sock, so argv length can never bite."""
+	monkeypatch.setattr(tmuxenv.shutil, "which", lambda name: "pi")
+	huge = "it's a " * 20_000
+	command = tmuxenv._build_pi_command(huge, model="openai-codex/gpt-6-astra", thinking="high")
+	assert "it's a" not in command
+	assert command == "pi --model openai-codex/gpt-6-astra --thinking high"
+	assert len(command) < 100
 
 
 def test_max_concurrent_env(monkeypatch):

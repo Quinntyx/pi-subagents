@@ -244,6 +244,8 @@ def test_agent_handle_str_shows_result_or_status(tmp_path):
 	server = bind_handle(h, tmp_path)
 	server.behaviors["state"] = {"isIdle": False, "hasPendingMessages": False}
 	try:
+		assert "status=starting" in str(h)
+		h.status = "running"
 		assert "status=running" in str(h)
 		assert "AgentHandle object at" not in repr(h)
 		h.settled_data = {"lastAssistant": {"content": "the reply", "timestamp": 1}}
@@ -323,3 +325,45 @@ def test_finish_defaults_to_every_spawned_handle(tmp_path, monkeypatch):
 	finally:
 		for server in servers:
 			server.close()
+
+
+def test_startup_delivers_the_initial_prompt_over_pisock(tmp_path, monkeypatch):
+	"""The initial prompt travels over pi-sock, not through tmux argv."""
+	from pi_subagents.handle import AgentHandle as AH
+
+	monkeypatch.setenv("PI_SUBAGENTS_STARTUP_TIMEOUT", "10")
+	monkeypatch.setattr("pi_subagents.handle.window_alive", lambda window_id: True)
+
+	prompt = "it's a test: don't \"fail\" on 'quotes' " * 50
+	h = AH(prompt, name="boot", cwd=str(tmp_path), window_name="boot", model=None, thinking=None, schema=None)
+	server = bind_handle(h, tmp_path)
+	h._startup_started = True
+	try:
+		h._run_startup()
+		assert h.status == "running"
+		assert h._startup_error is None
+		assert len(server.sent) == 1
+		assert server.sent[0]["type"] == "send"
+		assert server.sent[0]["text"] == prompt, "the prompt must arrive byte-for-byte"
+	finally:
+		server.close()
+
+
+def test_startup_failure_marks_the_handle_failed(tmp_path, monkeypatch):
+	from pi_subagents.handle import AgentHandle as AH
+	from pi_subagents import PiSubagentsError  # noqa: F401  (re-exported)
+
+	monkeypatch.setenv("PI_SUBAGENTS_STARTUP_TIMEOUT", "5")
+	# No server, and the window is gone: startup must fail loudly, not hang.
+	monkeypatch.setattr("pi_subagents.handle.window_alive", lambda window_id: False)
+
+	h = AH("hello", name="boot-fail", cwd=str(tmp_path), window_name="boot-fail", model=None, thinking=None, schema=None)
+	h._startup_started = True
+	h.window_id = "gone"
+	h.socket_path = os.path.join(str(tmp_path), "never.sock")
+	h._run_startup()
+
+	assert h.status == "failed"
+	assert h._startup_error is not None
+	with pytest.raises(PiSubagentsError, match="startup failed"):
+		h.wait(timeout=1)

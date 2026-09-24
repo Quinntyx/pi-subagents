@@ -25,6 +25,7 @@ from .catalog import (
 	thinking_levels,
 )
 from .envcheck import ensure_environment
+from .errors import PiSubagentsError, PiSubagentsTimeoutError
 import os
 from .registry import REGISTRY, emit_status_line
 from .handle import AgentHandle
@@ -61,12 +62,6 @@ __all__ = [
 __version__ = "0.1.0"
 
 
-class PiSubagentsError(Exception):
-	"""Base class for pi-subagents failures."""
-
-
-class PiSubagentsTimeoutError(PiSubagentsError, TimeoutError):
-	"""An agent did not settle within the allotted timeout."""
 
 
 def _depth() -> int:

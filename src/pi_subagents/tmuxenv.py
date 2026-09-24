@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import shlex
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -126,19 +127,26 @@ def spawn_pi_window(
 
 
 def _build_pi_command(prompt: str, *, model: str | None, thinking: str | None) -> str:
+	"""Command for the tmux window.
+
+	The prompt is deliberately NOT part of this command: it is delivered over
+	pi-sock after the instance reports ready. Passing it as a tmux argument
+	worked only up to tmux/OS argv limits — beyond that it was silently
+	truncated mid-string (which surfaced as a bizarre quoting error, since the
+	closing quote never arrived).
+	"""
 	pi = shutil.which("pi") or "pi"
-	parts = [pi]
+	parts = [shlex.quote(pi)]
 	if model:
-		parts += ["--model", model]
+		parts += ["--model", shlex.quote(model)]
 	if thinking:
-		parts += ["--thinking", thinking]
-	parts.append(_quote_for_tmux_shell(prompt))
+		parts += ["--thinking", shlex.quote(thinking)]
 	return " ".join(parts)
 
 
 def _quote_for_tmux_shell(text: str) -> str:
-	"""tmux runs the command via sh; single quotes are the safe envelope."""
-	return "'" + text.replace("'", "'\\''") + "'"
+	"""Quote a string for the shell tmux uses to run a window command."""
+	return shlex.quote(text)
 
 
 def window_alive(window_id: str) -> bool:

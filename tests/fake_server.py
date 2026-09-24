@@ -19,6 +19,7 @@ class FakePiSockServer:
 		self.sock_path = os.path.join(sock_dir, f"{name}.sock")
 		self.name = name
 		self.behaviors: dict[str, object] = {}
+		self.sent: list[dict] = []
 		self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 		self._server.bind(self.sock_path)
 		os.chmod(self.sock_path, 0o600)
@@ -77,6 +78,7 @@ class FakePiSockServer:
 		if ctype == "get_activity":
 			return {"type": "response", "command": ctype, "success": True, "data": _behavior("activity", {"available": False})}
 		if ctype == "send":
+			self.sent.append(command)
 			return {"type": "response", "command": ctype, "success": True, "data": {"delivered": True, "mode": "direct"}}
 		if ctype in ("abort", "subscribe"):
 			return {"type": "response", "command": ctype, "success": True, "data": {}}

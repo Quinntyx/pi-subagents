@@ -35,6 +35,11 @@ class AgentSession:
 			return self._session_file
 		if not self._handle.socket_path:
 			return None
+		# The session file only exists once pi has started and taken the prompt.
+		try:
+			self._handle._await_ready()
+		except Exception:
+			return None
 		from .client import PiSockUnavailable, SockClient
 
 		client = SockClient(self._handle.socket_path)

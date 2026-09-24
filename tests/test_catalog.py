@@ -125,3 +125,47 @@ def test_catalog_caches_until_refresh(fake_pi, tmp_path):
     assert len(catalog.list_models()) == 6
     with pytest.raises(RuntimeError):
         catalog.list_models(refresh=True)
+
+
+def test_a_stale_miss_is_retried_against_the_live_catalog(fake_pi, tmp_path, monkeypatch):
+    """A model added after the cache was filled must still be found.
+
+    This is the failure that motivated the TTL + retry: a long-lived PTC
+    interpreter cached the morning's catalog, so a model added later resolved to
+    None even though the CLI (and --model) knew it.
+    """
+    # 1. warm the cache with a lookup that misses
+    assert catalog.best_model_match("space-bunny-free") is None
+
+    # 2. the model shows up in the provider catalog (fake CLI now returns it)
+    script = tmp_path / "pi"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$1\" = \"--list-models\" ]; then\n"
+        "  if [ -n \"$2\" ]; then\n"
+        "    printf '%s\\n' 'provider model context max-out thinking images' "
+        "'opencode space-bunny-free 1.0M 524.3K yes yes' "
+        "'opencode-go space-bunny-free 1.0M 524.3K yes yes'; exit 0\n"
+        "  fi\n"
+        f"  cat <<'TABLE'\n{FAKE_TABLE}TABLE\n"
+        "fi\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+    # 3. still found, because a miss is never served from a stale cache
+    match = catalog.best_model_match("space-bunny-free")
+    assert match is not None
+    assert match.slug in ("opencode/space-bunny-free", "opencode-go/space-bunny-free")
+    assert catalog.model_slugs("space-bunny-free")
+
+
+def test_cache_entries_expire(fake_pi, monkeypatch):
+    monkeypatch.setenv("PI_SUBAGENTS_CATALOG_TTL", "0")
+    assert catalog._catalog_ttl() == 0.0
+    # TTL 0 disables caching: every call hits the CLI (and cannot go stale).
+    assert catalog.list_models()
+    first = catalog.list_models()
+    assert catalog.list_models() == first  # same data, fresh call
+
+    monkeypatch.setenv("PI_SUBAGENTS_CATALOG_TTL", "not-a-number")
+    assert catalog._catalog_ttl() == catalog.DEFAULT_CATALOG_TTL

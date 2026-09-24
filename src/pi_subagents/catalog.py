@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,7 +36,12 @@ __all__ = [
 THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 DEFAULT_CATALOG_TIMEOUT = 60.0
-_CACHE: dict[str | None, list["ModelInfo"]] = {}
+# The interpreter is long-lived (that is the point of a persistent session), so an
+# unbounded cache froze the catalog for the life of the session: a model added
+# later never appeared, even though spawning it with --model worked. Entries now
+# expire; PI_SUBAGENTS_CATALOG_TTL tunes the window (0 disables caching).
+DEFAULT_CATALOG_TTL = 120.0
+_CACHE: dict[str | None, tuple[float, list["ModelInfo"]]] = {}
 # Context sizes as printed by `pi --list-models`: 200K, 1M, 131.1K, 104.9K, ...
 _SIZE_COLUMN = re.compile(r"^\d+(?:\.\d+)?[KMB]?$")
 
@@ -70,6 +76,13 @@ def _catalog_timeout() -> float:
         return max(1.0, float(os.environ.get("PI_SUBAGENTS_CATALOG_TIMEOUT", DEFAULT_CATALOG_TIMEOUT)))
     except ValueError:
         return DEFAULT_CATALOG_TIMEOUT
+
+
+def _catalog_ttl() -> float:
+    try:
+        return max(0.0, float(os.environ.get("PI_SUBAGENTS_CATALOG_TTL", DEFAULT_CATALOG_TTL)))
+    except ValueError:
+        return DEFAULT_CATALOG_TTL
 
 
 def _pi_command() -> str:
@@ -119,10 +132,16 @@ def list_models(search: str | None = None, *, refresh: bool = False) -> list[Mod
     `search` is passed to `pi --list-models <search>`, which matches loosely (for
     example "astra" returns every provider's Astra variant), so it doubles as the
     lookup for "the user asked for model X, what is the slug?".
+
+    Results are cached per search term for `PI_SUBAGENTS_CATALOG_TTL` seconds
+    (default 120) so a long-lived session still sees newly added models; pass
+    `refresh=True` to bypass the cache.
     """
     key = search or ""
-    if not refresh and key in _CACHE:
-        return list(_CACHE[key])
+    if not refresh:
+        cached = _CACHE.get(key)
+        if cached is not None and (time.monotonic() - cached[0]) < _catalog_ttl():
+            return list(cached[1])
 
     env = {**os.environ, "PI_CODING_AGENT_DIR": str(subagent_profile_dir())}
     command = [_pi_command(), "--list-models"]
@@ -150,7 +169,7 @@ def list_models(search: str | None = None, *, refresh: bool = False) -> list[Mod
         raise RuntimeError(f"pi --list-models failed ({completed.returncode}): {detail}")
 
     rows = _parse_table(output)
-    _CACHE[key] = rows
+    _CACHE[key] = (time.monotonic(), rows)
     return list(rows)
 
 
@@ -172,8 +191,11 @@ def resolve_models(query: str, *, refresh: bool = False) -> list[ModelInfo]:
     exact = [row for row in list_models(None, refresh=refresh) if row.slug.lower() == needle]
     if exact:
         return exact
-    matches = list_models(query, refresh=refresh)
-    return [row for row in matches if needle in row.slug.lower()]
+    matches = [row for row in list_models(query, refresh=refresh) if needle in row.slug.lower()]
+    if matches or refresh:
+        return matches
+    # A miss is never served blindly from a possibly stale cache: ask the CLI again.
+    return [row for row in list_models(query, refresh=True) if needle in row.slug.lower()]
 
 
 def best_model_match(query: str, *, refresh: bool = False) -> ModelInfo | None:
