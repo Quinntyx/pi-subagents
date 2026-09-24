@@ -26,6 +26,7 @@ from .catalog import (
 )
 from .envcheck import ensure_environment
 from .errors import PiSubagentsError, PiSubagentsTimeoutError
+from .tmuxenv import subagent_session_name
 import os
 from .registry import REGISTRY, emit_status_line
 from .handle import AgentHandle
@@ -50,6 +51,7 @@ __all__ = [
 	"SchemaValidationError",
 	"list_agents",
 	"phase",
+	"subagent_session_name",
 	"wait_all",
 	"wait_all_async",
 	"stop_all",
