@@ -292,6 +292,45 @@ class AgentStage:
 		return f"<AgentStage {self.name!r} slots={self.slots}>"
 
 
+@dataclass(frozen=True)
+class PoolSummary:
+	"""Report returned by pool.close() — auto-echoed as the workflow's final line.
+
+	Wall time is what the user waited; agent time is what the fan-out consumed
+	(Σ agent runtimes) — their ratio is the parallelism win.
+	"""
+
+	name: str
+	submitted: int
+	settled: int
+	failed: int
+	cancelled: int
+	wall_ms: int
+	agent_ms: int
+	tool_calls: int
+	stages: dict[str, dict[str, int]]
+	failures: tuple[str, ...]
+
+	def __str__(self) -> str:
+		problems = self.failed + self.cancelled
+		glyph = "✗" if problems else "✓"
+		head = (
+			f"PoolSummary {glyph} {self.name}: {self.submitted} tasks · "
+			f"{self.settled} settled · {problems} stopped/failed · "
+			f"wall {self.wall_ms / 1000:.1f}s · agent-time {self.agent_ms / 1000:.1f}s · "
+			f"{self.tool_calls} tool calls"
+		)
+		stage_lines = [
+			f"  {name}: {counts.get('settled', 0)}/{counts.get('submitted', 0)} settled"
+			+ (f" · {counts.get('failed', 0)} failed" if counts.get("failed") else "")
+			+ (f" · {counts.get('cancelled', 0)} cancelled" if counts.get("cancelled") else "")
+			for name, counts in self.stages.items()
+		]
+		if self.failures:
+			stage_lines.append("  failures: " + "; ".join(self.failures[:5]) + (" …" if len(self.failures) > 5 else ""))
+		return "\n".join([head] + stage_lines)
+
+
 class AgentPool:
 	"""Autonomous bounded scheduler for multi-stage subagent workflows."""
 
@@ -317,6 +356,8 @@ class AgentPool:
 		self._jobs_by_handle: dict[str, _Job] = {}
 		self._results: deque[AgentResult] = deque()
 		self._reserved_sessions: dict[int, str] = {}
+		self._agent_ms = 0
+		self._tool_calls = 0
 		self._submit_sequence = 0
 		self._result_sequence = 0
 		self._running = 0
@@ -426,14 +467,43 @@ class AgentPool:
 				"startedAt": self.started_at,
 			}
 
-	def close(self) -> None:
-		"""Invalidate handles, stop work, destroy every retained window, and close."""
+	def close(self) -> PoolSummary:
+		"""Invalidate handles, stop work, destroy every retained window, and close.
+
+		Returns the workflow report (PoolSummary) — echoed when close() is the
+		cell's last line, so ending a fan-out produces its own stats.
+		"""
 		with self._condition:
 			if self._closed:
-				return
+				return PoolSummary(
+					name=self.name,
+					submitted=self._submit_sequence,
+					settled=0,
+					failed=0,
+					cancelled=0,
+					wall_ms=max(0, round(time.time() * 1000 - self.started_at)),
+					agent_ms=self._agent_ms,
+					tool_calls=self._tool_calls,
+					stages={},
+					failures=(),
+				)
 			self._closed = True
 			handles = list(self._handles.values())
 			live_sessions = {id(handle._live): handle._live for handle in handles if handle._live}
+			stages_summary = {
+				stage.name: {
+					"submitted": stage._submitted,
+					"settled": stage._settled,
+					"failed": stage._failed,
+					"cancelled": stage._cancelled,
+				}
+				for stage in self._stages
+			}
+			failures = tuple(
+				f"{result.task.name or result.handle.name} ({type(result.error).__name__ if result.error else result.status})"
+				for result in self._results
+				if result.status != "settled"
+			)
 			for stage in self._stages:
 				stage._queue.clear()
 			self._results.clear()
@@ -455,6 +525,19 @@ class AgentPool:
 		# rows naturally via exec-scope filtering.
 		REGISTRY.unregister_pool(self.id)
 		REGISTRY.emit()
+
+		return PoolSummary(
+			name=self.name,
+			submitted=self._submit_sequence,
+			settled=sum(stage._settled for stage in self._stages),
+			failed=sum(stage._failed for stage in self._stages),
+			cancelled=sum(stage._cancelled for stage in self._stages),
+			wall_ms=max(0, round(time.time() * 1000 - self.started_at)),
+			agent_ms=self._agent_ms,
+			tool_calls=self._tool_calls,
+			stages=stages_summary,
+			failures=failures,
+		)
 
 	def __enter__(self) -> "AgentPool":
 		return self
@@ -707,6 +790,12 @@ class AgentPool:
 		self._jobs_by_handle.pop(handle.id, None)
 		if handle._live is not None:
 			self._reserved_sessions.pop(id(handle._live), None)
+			try:
+				self._tool_calls += int(getattr(handle._live, "tool_calls", 0) or 0)
+			except Exception:
+				pass
+		if handle.runtime_ms:
+			self._agent_ms += handle.runtime_ms
 		if job.session_handle is not None and job.session_handle._live is not None:
 			self._reserved_sessions.pop(id(job.session_handle._live), None)
 		if not handle._future.done():

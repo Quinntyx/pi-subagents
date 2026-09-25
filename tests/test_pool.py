@@ -575,6 +575,36 @@ def test_direct_agent_api_is_gone():
 	assert not hasattr(pi_subagents, "set_phase")
 
 
+def test_close_returns_pool_summary(tmp_path, instant_factory):
+	factory, spawn = instant_factory
+	import pi_subagents.handle as handle_mod
+	original = handle_mod.spawn_pi_window_handle
+	handle_mod.spawn_pi_window_handle = spawn
+	try:
+		pool = AgentPool(concurrency=1)
+		stage = pool.stage("w", slots=1)
+		stage.submit(Task("p", name="job-one"))
+		result = run(pool.pop(timeout=10))
+		assert result is not None and result.ok
+		summary = pool.close()
+		assert summary.name.startswith("pool-")
+		assert summary.submitted == 1
+		assert summary.settled == 1
+		assert summary.failed == 0
+		assert summary.tool_calls >= 0
+		assert summary.wall_ms >= 0
+		assert "w" in summary.stages
+		text = str(summary)
+		assert "PoolSummary ✓" in text and "1 tasks" in text
+		assert "1/1 settled" in text
+		# AgentResult echoes readably: status + timing + the actual body
+		text = str(result)
+		assert text.startswith("✓ job-one (w)")
+		assert "hello" in text, "the echo shows the actual body, not a summary"
+	finally:
+		handle_mod.spawn_pi_window_handle = original
+
+
 def test_finish_closes_every_pool(tmp_path, instant_factory):
 	factory, spawn = instant_factory
 	import pi_subagents.handle as handle_mod
