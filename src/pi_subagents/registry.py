@@ -65,7 +65,7 @@ class Registry:
 		pool_states = [pool.snapshot() for pool in pools]
 		running = sum(1 for agent in agents if agent["status"] in ("starting", "running"))
 		queued = sum(1 for agent in agents if agent["status"] == "queued")
-		settled = sum(1 for agent in agents if agent["status"] == "settled")
+		settled = sum(1 for agent in agents if agent["status"] in ("settled", "closed"))
 		failed = sum(1 for agent in agents if agent["status"] in ("failed", "dead", "stopped", "cancelled"))
 		groups = {
 			stage["name"]: stage.get("startedAt")

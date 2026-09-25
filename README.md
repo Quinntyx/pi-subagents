@@ -1,205 +1,172 @@
 # pi-subagents
 
-Spawn, monitor, and steer **standalone, interactive pi instances** in tmux windows — the Python
-half of pi's dynamic subagent workflows. Subagents are real pi sessions in their own tmux
-windows (under the dedicated `subagents` pi profile), controlled over the
-[pi-sock](https://git.quinntyx.dev/quinntyx/pi-sock) unix socket, so you can watch them work
-in the TUI and intervene at any time.
+Pool-based orchestration of standalone pi instances from Python.
 
-## Install
+Subagents are real, interactive pi processes running in their own tmux windows
+(under the dedicated `subagents` pi profile), controlled over the pi-sock unix
+socket. The library works both inside a PTC session (state is forwarded to the
+PTC runtime as `subagent_state` frames for live UI) and from plain scripts run
+directly in a tmux pane (state is printed as one-line status updates).
 
-```sh
-# systemwide (the PTC venv — makes `import pi_subagents` available to PTC sessions)
-uv pip install --editable ~/docs/src/pi-subagents/main
+## The model
+
+Everything runs through an `AgentPool`: a bounded scheduler that owns stage
+queues, worker slots, and every pi process it starts.
+
+```python
+import pi_subagents as subagents
+
+pool = subagents.AgentPool(concurrency=8, name="features")
+build = pool.stage("build", slots=4)
+review = pool.stage("review", slots=4)
+
+build.submit_all(
+    subagents.Task(f"Implement {feature}", name=f"build-{feature}",
+                   metadata={"feature": feature})
+    for feature in FEATURES
+)
+
+while (result := await pool.pop()) is not None:
+    if result.stage is build and result.ok:
+        review.submit(
+            subagents.Task(f"Review this implementation:\n\n{result.body}",
+                           schema=REVIEW_SCHEMA),
+            parent=result,
+        )
+    elif result.stage is review:
+        verdict = result.unwrap()
+        rounds = result.task.metadata["rounds"]
+        if not verdict["passed"] and rounds < 5:
+            build.submit(
+                subagents.Task(f"Address this feedback:\n\n{verdict['feedback']}",
+                               name=f"fix-{result.task.metadata['feature']}",
+                               metadata={"rounds": rounds + 1}),
+                parent=result,
+            )
+
+pool.close()  # destroy retained windows and invalidate handles
 ```
-
-Note: since pi-ptc-next's auto-provisioning landed, this install is performed
-automatically at session start — the PTC venv is created if missing and
-pi-subagents is installed editable from your dev checkout (when present) or
-from a managed git clone of this repo (`pi update --extensions` refreshes it).
-The manual command above is only needed for non-PTC use.
-
-## Environment contract (checked at import)
-
-- `PI_SUBAGENT_DEPTH` set → `import pi_subagents` raises `NotImplementedError`.
-  Spawned agents cannot spawn further agents (the tree stays height 2 until the
-  `PI_PTC_PRIMARY` reporting mesh lands).
-- Not inside tmux (`$TMUX` missing or server unreachable) → the module imports with a
-  warning; every API call raises `NotImplementedError`. A script run outside tmux still
-  runs to completion — it just can't spawn agents.
 
 ## API
 
+### `Task(prompt, *, name=None, model=None, thinking=None, schema=None, cwd=None, profile=None, timeout=None, metadata=None)`
+
+Immutable description of one scheduled subagent turn. `metadata` is copied and
+exposed read-only; every task carries a non-negative integer `metadata["rounds"]`
+(roots default to 0). `timeout` bounds the turn's settle wait.
+
+### `AgentPool(concurrency=None, *, name=None)`
+
+Hard cap on concurrently running subagents (default and ceiling:
+`PI_SUBAGENTS_MAX_CONCURRENT`, 8). The pool runs its own worker threads, so work
+keeps flowing even when the orchestrating PTC chunk ends between turns.
+- `pool.stage(name, *, slots)` — create a queue (names are unique; the sum of
+  slots may not exceed the pool's concurrency).
+- `await pool.pop(timeout=None)` — next completion in pool-observed completion
+  order; `None` means *currently quiescent* (queues and running work empty) and
+  the pool stays usable. A deadline raises `AgentPoolTimeoutError` (carrying
+  `pool` and `snapshot`) without touching the work.
+- `pool.handles(status=None)` — snapshot of submitted handles.
+- `pool.snapshot()` — counters plus per-stage rows.
+- `pool.close()` — the only teardown: rejects submissions, cancels queued work,
+  aborts running turns, kills every tmux window (settled sessions included),
+  invalidates all handles, and wakes blocked `pop()` calls with
+  `PoolClosedError`. Idempotent.
+
+### `AgentStage`
+
+`stage.submit(task, *, parent=None, session_handle=None, session_name=None)` —
+enqueue and return an `AgentHandle` immediately; spawning happens when a worker
+slot frees. `submit_all(tasks)` fans out. Each stage has `slots` **soft**
+priority reservations: idle slots are borrowed by other stages (non-preemptive —
+borrowed runs finish before slots revert). With no stages defined the pool
+still schedules fairly across submissions to any stage.
+
+### `AgentHandle`
+
+One submission; valid while queued (steer/inspect only after dispatch).
+`await handle` (or `handle.wait(timeout)`) resolves to that task's `AgentResult`.
+`handle.cancel()` cancels queued work or aborts the running turn.
+`send(text, mode="steer")` steers the currently running turn; new turns go
+through `stage.submit()`.
+
+### `AgentResult`
+
+Immutable terminal outcome: `task`, `stage`, `handle`, `body`
+(`AgentStrResponse`/`AgentDictResponse`), `error`, `status`
+(`settled`/`failed`/`cancelled`), `duration_ms`, `parent`. `result.ok` and
+`result.unwrap()` (body or raises the stored error) are the two entry points;
+`result.session` exposes the parsed transcript. Failures arrive as results —
+`pop()` only raises for timeouts or a closed pool.
+
+### Session reuse
+
+`session_handle=result.handle` re-runs a settled pi session as a follow-up turn
+in the same tmux window instead of spawning a new one. The reused turn gets a
+new handle and result; the old ones stay settled and immutable. Omitted
+model/thinking/cwd/profile inherit the session's configuration; explicit
+conflicts raise `SessionReuseError`. A session processes one turn at a time
+(double-booking raises). `session_name="new-name"` renames the live pi session
+(pi updates its terminal title immediately). Settlement is correlated against
+the pre-follow-up message, so a reused session can never return a stale reply.
+
+### Cyclic workflows
+
+Reuse `parent=result` to propagate workflow identity. Only override what
+changes (typically `rounds`); everything else is inherited. Gate every cycle on
+a round limit — `pop()` returns `None` only when nothing is queued or running,
+so an ungated build→review→fix cycle runs forever.
+
+## Choosing a model or effort level
+
+The subagent profile can reach **every** model its pi install knows, so **never
+guess a slug and never refuse a named model** — look it up:
+
 ```python
-import pi_subagents as subagents
-
-# spawn — returns a live AgentHandle immediately
-handle = subagents.agent("Analyze the failing tests in tests/ and report root causes",
-                         name="test-digger")
-
-# per-subagent model / thinking level (passed to the spawned pi as --model/--thinking)
-reviewer = subagents.agent("Review the diff for correctness", name="reviewer",
-                           model="openai-codex/gpt-6-astra", thinking="high")
-cheap = subagents.agent("Count TODO comments in src/", name="counter",
-                        model="deepseek-router/deepseek-v4.1-flash", thinking="low")
-
-# the agent is a real pi instance in a tmux window: watch it there, or steer it
-await handle.send_async("focus on the auth module first", mode="steer")
-await handle.abort_async()          # "pause": stops the current run
-
-# wait for the settled result (str when no schema, dict when schema given)
-resp = await handle                                  # AgentStrResponse(str)
-resp = await subagents.agent("classify tests", name="c",
-                             schema={"type": "object",
-                                     "required": ["root_causes"],
-                                     "properties": {"root_causes": {"type": "array",
-                                                                    "items": {"type": "string"}}}})
-resp["root_causes"]                                  # AgentDictResponse(dict)
-
-# both response types carry the AgentSession (the pi session JSONL on disk)
-session = resp.get_session()
-session.tool_calls    # [{tool, arguments, durationMs, isError, result_preview}]
-session.thinking      # concatenated thinking blocks
-session.prose         # assistant text
-session.trajectory()  # ordered event stream
-session.session_file  # path to the pi session JSONL
-
-# resume after an abort: re-send a prompt on the same pi session — it continues
-# from where it left off (pi sessions persist on disk)
-handle.resume("continue")            # sync — re-opens the handle, returns it
-await handle                          # wait again
-
-# fan-out helpers
-responses = await subagents.wait_all_async([h1, h2, h3], timeout=600)
-
-# close subagents permanently once their work is done and no resume/steer/history
-# inspection is needed — this is what keeps tmux windows from piling up
-subagents.finish()               # close everything this session spawned
-subagents.finish([h1, h2])       # or just these handles; h.kill() is the per-handle form
-subagents.stop_all()             # abort every run (windows stay open)
-subagents.list()                 # snapshot rows for every spawned agent
+caps = subagents.capabilities()          # counts, providers, defaults, caps
+subagents.best_model_match("flash")      # one pick: .slug, .context, .thinking, .images
+subagents.model_slugs("astra")           # every matching slug
+subagents.resolve_models("opus")         # full rows (context, thinking, images)
 ```
 
-### Choosing a model (`model=` / `thinking=`)
+`best_model_match` prefers an exact slug, then the profile's default provider,
+then first-party entries over proxied ones; it returns `None` when nothing
+genuinely matches. Pass a full `provider/model` slug when a specific provider's
+variant matters. The catalog is re-read every couple of minutes
+(`PI_SUBAGENTS_CATALOG_TTL`), a lookup that misses is re-checked live, and
+`list_models(refresh=True)` bypasses the cache.
 
-```python
-caps = subagents.capabilities()        # defaults, providers, thinking levels, caps; no catalog dump
-subagents.thinking_levels()            # ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-subagents.scoped_models()              # the subagent profile's picker set (not a limit on agent(model=))
-subagents.model_slugs("astra")         # every matching `provider/model` slug
-subagents.resolve_models("opus")       # matching ModelInfo rows (context, max output, thinking, images)
-subagents.best_model_match("astra")    # one pick: .slug / .context / .thinking / .images
-```
-
-### Choosing a profile (`profile=`)
-
-```python
-# Special-purpose subagent profiles: extra extensions / system prompts / skills.
-# Default is "subagents"; bare names resolve under ~/.config/pi/profiles,
-# explicit paths also work.
-designer = subagents.agent("Design a checkout flow mock", name="designer",
-                           profile="design-subagents", cwd="./mock")
-```
-
-The catalog is read from `pi --list-models` as seen by the subagent's pi profile, so
-it is exactly what a spawned instance can resolve (610 models across 9 providers on
-the author's machine). `best_model_match` prefers an exact slug, then the profile's
-own default provider, then first-party entries over proxied ones, breaking
-remaining ties in catalog order; it returns `None` when nothing genuinely matches
-(the CLI search is fuzzy and returns unrelated neighbours, which the helper filters
-out). Pass a full `provider/model` slug when a specific provider's variant matters —
-exact slugs always win.
-
-**Freshness.** Results are cached per search term for `PI_SUBAGENTS_CATALOG_TTL`
-seconds (default 120). The cache must expire: the interpreter is long-lived, so an
-unbounded cache froze the catalog for the life of the session and hid models added
-later (they still spawned fine via `model=`). A lookup that finds nothing is retried
-against the live catalog before `None` is returned, and `refresh=True` bypasses the
-cache entirely.
+Prompts have no size limit: they are delivered to the subagent over pi-sock,
+not through the tmux command.
 
 ## Identifying subagents in the tmux overview
 
-Every subagent window is launched with `pi --name "(subagent) <name>"`, so pi's
-own terminal title — the string tmux's overview shows — marks the process:
-`π - (subagent) test-digger - Vault`, against a main agent's `π - Vault`. The
-tmux window keeps the short agent name, and the named session also shows up that
-way in pi's own session picker. (pi composes the title as
-`π - [<session name> - ]<cwd>`, hence the marker sits before the directory.)
+Every subagent window is launched with `pi --name "(subagent) <name>"`, so the
+terminal title tmux's overview shows reads `π - (subagent) build-auth - Vault`
+against a main agent's `π - Vault`. The tmux window keeps the short agent name.
 
-## The initial prompt travels over pi-sock
+## Environment knobs
 
-The tmux window starts a bare `pi`; the prompt is delivered through pi-sock once the
-instance answers `get_state` (pi-sock binds during `session_start`, so a responsive
-socket means the session is up). This keeps prompts out of the `tmux new-window`
-argv, where anything past tmux/OS limits was silently truncated mid-string — the
-lost closing quote made it look like a quoting bug, and a 200 KB prompt could not be
-spawned at all. `spawn()` therefore returns immediately with the handle in
-`starting`; every control method (`send`/`state`/`activity`/`wait`/`resume`) waits
-for that first delivery, so a `send()` right after `agent()` can never overtake the
-initial prompt; and a subagent whose pi never comes up is killed rather than
-orphaned (`handle.status == "failed"`, and `wait()` explains why).
+- `PI_SUBAGENTS_MAX_CONCURRENT` (8) — global ceiling shared by all pools.
+- `PI_SUBAGENTS_SETTLE_TIMEOUT` (30 min) — default per-turn settle wait.
+- `PI_SUBAGENTS_STARTUP_TIMEOUT` (90 s) — pi-sock readiness + first delivery.
+- `PI_SUBAGENTS_SCHEMA_RETRIES` (3) — JSON repair rounds for schema tasks.
+- `PI_SUBAGENTS_CATALOG_TTL` (120 s) — model-catalog cache lifetime.
+- `PI_SUBAGENTS_PROFILE` — default subagent pi profile directory.
 
-### Sync vs async
+## Rules
 
-Plain scripts use the sync surface: `handle.wait(timeout=...)`, `handle.send(text)`,
-`handle.resume(prompt)`, `subagents.wait_all(handles)`. Inside PTC sessions (async
-user code) prefer `wait_async` / `send_async` / `resume_async` / `wait_all_async`.
-Calling a blocking `wait*` from a running event loop raises `ValueError("await on
-closed handle")`-style guards appropriately — actually it raises
-`PiSubagentsError` directing you to the async variant.
-
-### Semantics
-
-- **`await handle` never implicitly resumes an aborted handle** — it raises
-  `ValueError: await on closed handle`. Resuming is explicit: `resume()`/`resume_async()`.
-- **Settle detection** subscribes to pi-sock's `agent_settled` semantics via polling
-  (`get_state` + `get_message`), so retries/compaction/queued follow-ups are drained
-  before the response resolves.
-- **State emission**: inside a PTC session, every mutation emits a `subagent_state`
-  snapshot through the PTC bridge (`builtins.PTC_STATE_EMIT`), which the
-  [pi-ptc-next](https://github.com/Quinntyx/pi-ptc-next) extension renders as a live
-  subagent panel. Standalone scripts print one-line status updates to stdout.
-  Activity detail (tool calls, thinking time, phase/label) comes from pi-sock's
-  `get_activity` command when pi-tool-tree is installed in the subagent's pi session.
-- **Caps**: `PI_SUBAGENTS_MAX_CONCURRENT` (default 8) refuses spawns beyond the limit.
-
-### Environment variables
-
-| Variable | Meaning |
-| --- | --- |
-| `PI_SUBAGENTS_PROFILE` | pi profile directory subagents launch with (default `~/.config/pi/profiles/subagents`) |
-| `PI_SUBAGENT_DEPTH` | nesting depth (set by the spawner on children; locks spawning) |
-| `PI_SUBAGENTS_MAX_CONCURRENT` | concurrent-subagent cap (default 8) |
-| `PI_SUBAGENTS_SETTLE_TIMEOUT` | default settle timeout in seconds (default 1800) |
-| `PI_SUBAGENTS_SCHEMA_RETRIES` | structured-output retry attempts (default 3) |
-| `PI_PTC_PRIMARY` | reserved for the future primary-session usage reporting mesh |
-
-## CLI
-
-```sh
-python -m pi_subagents list            # all subagent sockets + state
-python -m pi_subagents abort <name>    # abort a running subagent
-python -m pi_subagents prune [name]    # unlink stale sockets from crashed pi processes
-```
-
-## Example standalone script
-
-```python
-#!/usr/bin/env python3
-"""Run from a tmux pane (not from pi) to see subagents work in real time."""
-import pi_subagents as subagents
-
-handles = [
-    subagents.agent("Audit every file under src/ for TODO comments; return a list.", name="todo-sweep"),
-    subagents.agent("Run the test suite and summarize any failures.", name="test-runner"),
-]
-for h, resp in zip(handles, subagents.wait_all(handles, timeout=900)):
-    print(f"=== {h.name} ({h.session.duration_ms} ms, {h.session.turns} turns)")
-    print(resp)
-```
-
-## Development
-
-```sh
-python3 -m pytest tests/ -q
-```
+- Top-level `await` is available inside `python_exec` chunks — `await handle`,
+  never `asyncio.run(...)`.
+- Spawned agents cannot spawn agents (depth 1; `import pi_subagents` raises
+  there).
+- Statuses: `queued → starting → running → settled`, or `failed`
+  (startup/provider error), `cancelled`, `closed` (pool closed). An errored
+  provider turn may keep the turn waiting until `Task.timeout` fires — set
+  explicit timeouts for tasks whose models can fail.
+- The idle timeout of a PTC chunk (`PTC_EXECUTION_TIMEOUT_MS`) is re-armed by
+  every registry tick, so a pool workflow may run for hours; interrupting the
+  chunk (Esc / `/ptc interrupt`) stops the chunk, not the pool — re-`pop()` in
+  the next chunk to resume consuming.
+- `subagents.finish()` closes every live pool; `subagents.stop_all()` cancels
+  queued/running work but leaves pools open.

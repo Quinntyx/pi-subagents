@@ -450,8 +450,9 @@ class AgentPool:
 		for worker in self._workers:
 			if worker is not threading.current_thread():
 				worker.join(timeout=2.0)
-		for handle in handles:
-			REGISTRY.unregister(handle.id)
+		# Handles stay registered as "closed": the completed chunk's snapshot keeps
+		# the workflow visible (notification + panel), and later execs drop these
+		# rows naturally via exec-scope filtering.
 		REGISTRY.unregister_pool(self.id)
 		REGISTRY.emit()
 
