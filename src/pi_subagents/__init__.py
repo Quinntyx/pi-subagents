@@ -45,7 +45,7 @@ from .tmuxenv import subagent_session_name
 import os
 from .registry import REGISTRY, emit_status_line
 from .handle import AgentHandle as _LiveSessionHandle
-from .pool import AgentHandle, AgentPool, AgentStage
+from .pool import AgentHandle, AgentPool, AgentStage, PoolSummary
 from .result import AgentResult
 from .schema import SchemaValidationError
 from .session_file import AgentSession
@@ -57,6 +57,7 @@ __all__ = [
 	"AgentStage",
 	"AgentHandle",
 	"AgentResult",
+	"PoolSummary",
 	"Task",
 	"capabilities",
 	"list_models",
