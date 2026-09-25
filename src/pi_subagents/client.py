@@ -99,6 +99,9 @@ class SockClient:
 	def abort(self) -> dict:
 		return self.request({"type": "abort"})
 
+	def set_session_name(self, name: str) -> dict:
+		return self.request({"type": "set_session_name", "name": name})
+
 	def is_alive(self) -> bool:
 		try:
 			self.state()
@@ -111,6 +114,7 @@ class SockClient:
 		timeout: float | None,
 		poll: float = DEFAULT_POLL_INTERVAL,
 		on_tick: Callable[[dict], None] | None = None,
+		after_message: dict | None = None,
 	) -> dict | None:
 		"""Wait until the agent settles.
 
@@ -130,13 +134,11 @@ class SockClient:
 				return None  # pi is gone; treat as dead rather than hanging
 			if not state.get("isIdle"):
 				saw_running = True
-			elif saw_running:
-				saw_settle = True
-			elif not state.get("hasPendingMessages") and self.message() is not None:
-				# finished (or never started and already replied) — settle
-				saw_settle = True
-			if saw_settle:
+			elif not state.get("hasPendingMessages"):
 				last = self.message()
+				if last is not None and (saw_running or last != after_message):
+					saw_settle = True
+			if saw_settle:
 				return {"lastAssistant": last, "isIdle": True}
 			if on_tick is not None:
 				on_tick(state)
@@ -233,11 +235,15 @@ class AsyncSockClient:
 	async def abort(self) -> dict:
 		return await self.request({"type": "abort"})
 
+	async def set_session_name(self, name: str) -> dict:
+		return await self.request({"type": "set_session_name", "name": name})
+
 	async def wait_settled(
 		self,
 		timeout: float | None,
 		poll: float = DEFAULT_POLL_INTERVAL,
 		on_tick: Callable[[dict], Any] | None = None,
+		after_message: dict | None = None,
 	) -> dict | None:
 		deadline = (time.monotonic() + timeout) if timeout is not None else None
 		saw_running = False
@@ -249,12 +255,11 @@ class AsyncSockClient:
 				return None
 			if not state.get("isIdle"):
 				saw_running = True
-			elif saw_running:
-				saw_settle = True
-			elif not state.get("hasPendingMessages") and (await self.message()) is not None:
-				saw_settle = True
-			if saw_settle:
+			elif not state.get("hasPendingMessages"):
 				last = await self.message()
+				if last is not None and (saw_running or last != after_message):
+					saw_settle = True
+			if saw_settle:
 				return {"lastAssistant": last, "isIdle": True}
 			if on_tick is not None:
 				result = on_tick(state)

@@ -50,7 +50,7 @@ def _validate(schema: dict, value, path: str) -> None:
 			"null": lambda v: v is None,
 		}
 		types = stype if isinstance(stype, list) else [stype]
-		if not any(checker(t)(value) for t, checker in ((t, checkers.get(t, lambda v: False)) for t in types) if t in checkers):
+		if not any(checker(value) for t, checker in checkers.items() if t in types):
 			raise SchemaValidationError(f"{path}: expected type {stype!r}")
 	if "enum" in schema and value not in schema["enum"]:
 		raise SchemaValidationError(f"{path}: not in enum {schema['enum']!r}")

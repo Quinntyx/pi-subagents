@@ -87,11 +87,14 @@ def test_resume_async_reopens(tmp_path):
 		h = AgentHandle("p", name="a4", cwd=str(tmp_path), window_name="a4", model=None, thinking=None, schema=None)
 		server = bind_handle(h, tmp_path)
 		server.behaviors["state"] = {"isIdle": True, "hasPendingMessages": False}
-		server.behaviors["message"] = {"content": "continued", "timestamp": 3}
+		server.behaviors["message"] = {"content": "old answer", "timestamp": 3}
 		try:
 			await h
 			h2 = await h.resume_async("continue please")
 			assert h2 is h and h.closed is False and h.status == "running"
+			# a fresh message (new timestamp) is required: resume must never
+			# mistake the pre-existing reply for the follow-up's settlement
+			server.behaviors["message"] = {"content": "continued", "timestamp": 4}
 			resp = await h.wait_async(timeout=5)
 			assert resp == "continued"
 		finally:

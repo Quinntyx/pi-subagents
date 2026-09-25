@@ -1,10 +1,4 @@
-"""Registry of spawned subagents + state emission.
-
-Every mutation emits a compact snapshot. When running inside a PTC session the
-runtime has injected ``builtins.PTC_STATE_EMIT`` and the snapshot rides the PTC
-RPC pipe as a ``subagent_state`` frame (transparent UI); otherwise a one-line
-status is printed to stdout so standalone tmux scripts still show progress.
-"""
+"""Registry of pool-owned handles plus PTC state emission."""
 
 from __future__ import annotations
 
@@ -12,21 +6,11 @@ import builtins
 import os
 import threading
 import time
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:  # pragma: no cover
-	from .handle import AgentHandle
+from typing import Any
 
 
 def current_exec_scope() -> str | None:
-	"""Exec token of the PTC chunk that is currently running.
-
-	Set by the session runtime as ``builtins.PTC_EXEC_SCOPE`` for the duration of
-	each chunk, so agents registered while it runs are attributed to it. The host's
-	viewer then renders only the agents of the exec it is streaming, which keeps
-	older settled batches (from earlier chunks in the same long-lived interpreter)
-	out of the current view.
-	"""
+	"""Exec token of the PTC chunk that is currently running."""
 	token = getattr(builtins, "PTC_EXEC_SCOPE", None)
 	return token if isinstance(token, str) and token else None
 
@@ -38,47 +22,68 @@ def _ptc_bridge():
 
 class Registry:
 	def __init__(self) -> None:
-		self._handles: dict[str, "AgentHandle"] = {}
+		self._handles: dict[str, Any] = {}
+		self._pools: dict[str, Any] = {}
 		self._lock = threading.Lock()
-		self._phase: str | None = None
-		self._phase_started_at: float | None = None
 		self._last_fingerprint: str | None = None
 
-	def register(self, handle: "AgentHandle") -> None:
+	def register(self, handle: Any) -> None:
 		with self._lock:
 			self._handles[handle.id] = handle
 
-	def handles(self) -> list["AgentHandle"]:
+	def unregister(self, handle_id: str) -> None:
+		with self._lock:
+			self._handles.pop(handle_id, None)
+
+	def handles(self) -> list[Any]:
 		with self._lock:
 			return list(self._handles.values())
 
-	def get(self, handle_id: str) -> "AgentHandle | None":
+	def get(self, handle_id: str):
 		with self._lock:
 			return self._handles.get(handle_id)
 
-	def set_phase(self, label: str | None) -> None:
-		"""Label the current orchestration phase (viewer grouping)."""
+	def register_pool(self, pool: Any) -> None:
 		with self._lock:
-			self._phase = label
-			self._phase_started_at = time.time() * 1000 if label else None
-		self.emit()
+			self._pools[pool.id] = pool
 
-	def current_phase(self) -> str | None:
+	def unregister_pool(self, pool_id: str) -> None:
 		with self._lock:
-			return self._phase
+			self._pools.pop(pool_id, None)
+
+	def pools(self) -> list[Any]:
+		with self._lock:
+			return list(self._pools.values())
 
 	def snapshot(self) -> dict:
+		# Never call user/pool methods while holding the registry lock. Pool workers
+		# emit concurrently, and the inverse lock order would deadlock.
 		with self._lock:
-			agents = [handle.agent_state() for handle in self._handles.values()]
-		running = sum(1 for a in agents if a["status"] in ("starting", "running"))
-		settled = sum(1 for a in agents if a["status"] == "settled")
-		failed = sum(1 for a in agents if a["status"] in ("failed", "dead", "stopped"))
+			handles = list(self._handles.values())
+			pools = list(self._pools.values())
+		agents = [handle.agent_state() for handle in handles]
+		pool_states = [pool.snapshot() for pool in pools]
+		running = sum(1 for agent in agents if agent["status"] in ("starting", "running"))
+		queued = sum(1 for agent in agents if agent["status"] == "queued")
+		settled = sum(1 for agent in agents if agent["status"] == "settled")
+		failed = sum(1 for agent in agents if agent["status"] in ("failed", "dead", "stopped", "cancelled"))
+		groups = {
+			stage["name"]: stage.get("startedAt")
+			for pool in pool_states
+			for stage in pool.get("stages", [])
+		}
 		return {
 			"pid": os.getpid(),
 			"depth": _depth_int(),
 			"agents": agents,
-			"totals": {"running": running, "settled": settled, "failed": failed},
-			"groups": {self._phase: self._phase_started_at} if self._phase else {},
+			"pools": pool_states,
+			"totals": {
+				"queued": queued,
+				"running": running,
+				"settled": settled,
+				"failed": failed,
+			},
+			"groups": groups,
 			"timestamp": time.time() * 1000,
 		}
 
@@ -86,17 +91,32 @@ class Registry:
 		snapshot = self.snapshot()
 		bridge = _ptc_bridge()
 		if bridge is not None:
-			# In a PTC session every tick is forwarded: the frames double as
-			# liveness signals (the host's idle timeout is re-armed on them) and
-			# as animation fuel for the live viewer. Unchanged snapshots are cheap.
 			try:
 				bridge(snapshot)
 				return
 			except Exception:
-				pass  # never let UI plumbing break agent control flow
-		fingerprint = repr(sorted((a["id"], a["status"], a["toolCalls"], a["thinkingMs"], a["label"], a["awaited"], a["ctx"], a["group"]) for a in snapshot["agents"]))
+				pass
+		fingerprint = repr(
+			(
+				sorted(
+					(
+						agent["id"], agent["status"], agent["toolCalls"], agent["thinkingMs"],
+						agent["label"], agent["awaited"], agent["ctx"], agent["group"],
+					)
+					for agent in snapshot["agents"]
+				),
+				[
+					(
+						pool["id"], pool["running"], pool["queued"], pool["results"],
+						tuple((stage["id"], stage["queued"], stage["running"], stage["settled"], stage["failed"])
+						      for stage in pool["stages"]),
+					)
+					for pool in snapshot["pools"]
+				],
+			)
+		)
 		if not force and fingerprint == self._last_fingerprint:
-			return  # nothing changed; skip the standalone print
+			return
 		self._last_fingerprint = fingerprint
 		emit_status_line(snapshot)
 
@@ -112,6 +132,8 @@ def emit_status_line(snapshot: dict) -> None:
 	"""Compact human-readable one-liner for standalone runs."""
 	totals = snapshot.get("totals", {})
 	parts = []
+	if totals.get("queued"):
+		parts.append(f"… {totals['queued']} queued")
 	if totals.get("running"):
 		parts.append(f"● {totals['running']} running")
 	if totals.get("settled"):
@@ -122,7 +144,7 @@ def emit_status_line(snapshot: dict) -> None:
 		return
 	details = []
 	for agent in snapshot.get("agents", []):
-		if agent["status"] in ("starting", "running"):
+		if agent["status"] in ("queued", "starting", "running"):
 			detail = f"{agent['name']}: {agent.get('toolCalls') or 0} calls"
 			label = agent.get("label") or agent.get("phase")
 			if label:

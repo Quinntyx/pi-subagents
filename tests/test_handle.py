@@ -187,18 +187,41 @@ def test_activity_absorbed_into_handle_state(tmp_path):
 		server.close()
 
 
-def test_concurrent_limit(tmp_path, monkeypatch):
-	monkeypatch.setenv("PI_SUBAGENTS_MAX_CONCURRENT", "1")
-	from pi_subagents.registry import REGISTRY
-	h = AgentHandle("p", name="t10", cwd=str(tmp_path), window_name="t10", model=None, thinking=None, schema=None)
-	server = bind_handle(h, tmp_path)
-	server.behaviors["state"] = {"isIdle": False, "hasPendingMessages": False}
-	REGISTRY.register(h)
+def test_pool_close_kills_windows_and_prunes_sockets(tmp_path, monkeypatch):
+	"""pool.close() destroys the retained tmux window via the real kill path."""
+	from pi_subagents import AgentPool, Task
+
+	killed = []
+	monkeypatch.setattr(handle_mod, "kill_window", lambda window_id: killed.append(window_id))
+	monkeypatch.setattr(handle_mod, "window_alive", lambda window_id: False)
+
+	servers = []
+
+	def spawn(prompt, **kwargs):
+		live = AgentHandle(prompt, name=kwargs.get("name") or "f1", cwd=str(tmp_path),
+			window_name=kwargs.get("name") or "f1", model=None, thinking=None, schema=None)
+		server = FakePiSockServer(str(tmp_path), live.id)
+		server.behaviors["state"] = {"isIdle": True, "hasPendingMessages": False}
+		server.behaviors["message"] = {"content": "x", "timestamp": 1}
+		live._bind(type("Ref", (), {"window_id": live.name + "-win", "socket_path": server.sock_path, "name": live.name})())
+		servers.append(server)
+		return live
+
+	original = handle_mod.spawn_pi_window_handle
+	handle_mod.spawn_pi_window_handle = spawn
 	try:
-		with pytest.raises(Exception, match="limit reached"):
-			handle_mod.spawn_pi_window_handle("p2", name="t11", cwd=str(tmp_path))
+		pool = AgentPool(concurrency=1)
+		stage = pool.stage("s", slots=1)
+		h = stage.submit(Task("p", name="f1"))
+		result = h.wait(timeout=10)
+		assert result.body == "x"
+		pool.close()
+		assert killed == [h._live.window_id]
+		assert not os.path.exists(h._live.socket_path), "socket should be unlinked after kill"
 	finally:
-		server.close()
+		handle_mod.spawn_pi_window_handle = original
+		for server in servers:
+			server.close()
 
 
 def test_session_jsonl_trajectory(tmp_path):
@@ -266,65 +289,6 @@ def test_str_response_plain_string_semantics(tmp_path):
 		assert len(resp) == 6
 	finally:
 		server.close()
-
-
-def test_finish_kills_windows_and_prunes_sockets(tmp_path, monkeypatch):
-	"""After finish(), tmux windows are gone and sockets are unlinked."""
-	from pi_subagents.registry import REGISTRY
-	import pi_subagents.handle as handle_mod
-
-	killed = []
-	monkeypatch.setattr(handle_mod, "kill_window", lambda window_id: killed.append(window_id))
-	# window_alive is consulted by handle.is_window_alive; keep it permissive.
-	monkeypatch.setattr(handle_mod, "window_alive", lambda window_id: False)
-
-	h1 = AgentHandle("p", name="f1", cwd=str(tmp_path), window_name="f1", model=None, thinking=None, schema=None)
-	server1 = bind_handle(h1, tmp_path)
-	server1.behaviors["state"] = {"isIdle": True, "hasPendingMessages": False}
-	server1.behaviors["message"] = {"content": "x", "timestamp": 1}
-	h2 = AgentHandle("p", name="f2", cwd=str(tmp_path), window_name="f2", model=None, thinking=None, schema=None)
-	server2 = bind_handle(h2, tmp_path)
-	REGISTRY.register(h1)
-	REGISTRY.register(h2)
-	try:
-		str(h1.wait(timeout=5))
-		closed = __import__("pi_subagents").finish([h1, h2])
-		assert closed == 2
-		assert killed == [h1.window_id, h2.window_id]
-		assert h1.status == "dead" and h2.status == "dead"
-		assert not os.path.exists(h1.socket_path), "socket should be unlinked after kill"
-		assert REGISTRY.handles()[0].status == "dead"
-	finally:
-		server1.close()
-		server2.close()
-
-
-def test_finish_defaults_to_every_spawned_handle(tmp_path, monkeypatch):
-	from pi_subagents import finish
-	from pi_subagents.registry import REGISTRY
-	import pi_subagents.handle as handle_mod
-
-	killed = []
-	monkeypatch.setattr(handle_mod, "kill_window", lambda window_id: killed.append(window_id))
-
-	handles = []
-	servers = []
-	for name in ("g1", "g2", "g3"):
-		h = AgentHandle("p", name=name, cwd=str(tmp_path), window_name=name, model=None, thinking=None, schema=None)
-		server = bind_handle(h, tmp_path)
-		server.behaviors["state"] = {"isIdle": True, "hasPendingMessages": False}
-		server.behaviors["message"] = {"content": "x", "timestamp": 1}
-		REGISTRY.register(h)
-		handles.append(h)
-		servers.append(server)
-	try:
-		str(h.wait(timeout=5))
-		assert __import__("pi_subagents").finish() == 3
-		assert killed == [h.window_id for h in handles]
-		assert all(h.status == "dead" for h in handles)
-	finally:
-		for server in servers:
-			server.close()
 
 
 def test_startup_delivers_the_initial_prompt_over_pisock(tmp_path, monkeypatch):

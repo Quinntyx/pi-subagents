@@ -21,7 +21,7 @@ from .envcheck import require_environment
 from .registry import REGISTRY
 from .response import AgentDictResponse, AgentStrResponse
 from .schema import SchemaValidationError, validate_schema, validate_with_schema
-from .tmuxenv import kill_window, max_concurrent, spawn_pi_window, unique_socket_name, window_alive
+from .tmuxenv import kill_window, spawn_pi_window, unique_socket_name, window_alive
 
 DEFAULT_SETTLE_TIMEOUT = 30 * 60.0
 # How long to wait for a freshly spawned pi to bring its pi-sock socket up and
@@ -96,6 +96,9 @@ class AgentHandle:
 		self.ctx_limit: int | None = None
 		self.ctx_percent: float | None = None
 		self._session: AgentSession | None = None
+		# Message present immediately before a follow-up is sent. Settlement must
+		# produce a different message so a retained session cannot return stale data.
+		self._wait_baseline: dict | None = None
 		# Readiness/delivery of the initial prompt (see _run_startup).
 		self._ready: concurrent.futures.Future = concurrent.futures.Future()
 		self._startup_error: Exception | None = None
@@ -260,16 +263,21 @@ class AgentHandle:
 		return result
 
 	def resume(self, prompt: str | None = None) -> "AgentHandle":
-		"""Un-close the handle and send a new prompt on the same pi session.
-
-		Re-sending a prompt continues the session from where the agent left off
-		(pi sessions persist on disk). This is the intended "resume".
-		"""
+		"""Start a pool-scheduled follow-up on this retained pi session."""
 		if not self.closed and self.status not in ("stopped", "failed", "dead", "settled"):
 			raise ValueError("resume on a handle that is still running; abort it first")
 		self._await_ready()
+		try:
+			self._wait_baseline = self._sync.message()
+		except PiSockError:
+			self._wait_baseline = None
 		self.closed = False
 		self.settled_data = None
+		self.runtime_ms = None
+		self.started_at = time.time() * 1000
+		if self._session is not None:
+			self._session.invalidate()
+		self._session = None
 		self.status = "running"
 		REGISTRY.emit()
 		text = prompt if prompt is not None else "Continue."
@@ -283,8 +291,17 @@ class AgentHandle:
 		if not self.closed and self.status not in ("stopped", "failed", "dead", "settled"):
 			raise ValueError("resume on a handle that is still running; abort it first")
 		await self._await_ready_async()
+		try:
+			self._wait_baseline = await self._async.message()
+		except PiSockError:
+			self._wait_baseline = None
 		self.closed = False
 		self.settled_data = None
+		self.runtime_ms = None
+		self.started_at = time.time() * 1000
+		if self._session is not None:
+			self._session.invalidate()
+		self._session = None
 		self.status = "running"
 		REGISTRY.emit()
 		text = prompt if prompt is not None else "Continue."
@@ -293,6 +310,11 @@ class AgentHandle:
 		except PiSockUnavailable:
 			self._mark_dead()
 		return self
+
+	def set_session_name(self, name: str) -> dict:
+		"""Rename the live pi session; pi updates its terminal title immediately."""
+		self._await_ready()
+		return self._sync.set_session_name(name)
 
 	def kill(self) -> None:
 		"""Close the subagent permanently: abort the run and destroy its tmux window.
@@ -396,6 +418,7 @@ class AgentHandle:
 				timeout if timeout is not None else _settle_timeout_default(),
 				poll=poll,
 				on_tick=self._tick_sync,
+				after_message=self._wait_baseline,
 			)
 		finally:
 			self.awaited = False
@@ -423,6 +446,7 @@ class AgentHandle:
 				timeout if timeout is not None else _settle_timeout_default(),
 				poll=poll,
 				on_tick=self._tick_async,
+				after_message=self._wait_baseline,
 			)
 		except PiSockUnavailable:
 			self._mark_dead()
@@ -519,6 +543,7 @@ class AgentHandle:
 			raise TimeoutError(f"subagent {self.name}: settle timeout exceeded")
 		self._absorb_from_state(settle)
 		self.settled_data = settle
+		self._wait_baseline = None
 		self.status = "settled"
 		self._stamp_runtime()
 		REGISTRY.emit()
@@ -635,14 +660,12 @@ def spawn_pi_window_handle(
 	thinking: str | None = None,
 	schema: dict | None = None,
 	profile: str | os.PathLike[str] | None = None,
+	group: str | None = None,
+	session_name: str | None = None,
+	register: bool = True,
 ) -> AgentHandle:
-	"""Spawn a pi window and return its AgentHandle (used by subagents.agent)."""
+	"""Spawn one live pi session for the pool scheduler."""
 	depth = int(os.environ.get("PI_SUBAGENT_DEPTH", "0") or 0) + 1
-	running = sum(1 for state in REGISTRY.snapshot()["agents"] if state["status"] in ("starting", "running"))
-	if running >= max_concurrent():
-		raise PiSockError(
-			f"concurrent subagent limit reached ({max_concurrent()}); abort or wait for one to settle"
-		)
 	handle = AgentHandle(
 		prompt,
 		name=name or "subagent",
@@ -662,25 +685,14 @@ def spawn_pi_window_handle(
 		socket_name=handle.id,
 		depth=depth,
 		profile=profile,
+		session_name=session_name,
 	)
-	handle.group = current_phase()
+	handle.group = group
 	handle._bind(window_ref)
-	REGISTRY.register(handle)
+	if register:
+		REGISTRY.register(handle)
 	# Deliver the initial prompt over pi-sock once the instance is ready.
 	handle._startup_started = True
 	threading.Thread(target=handle._run_startup, name=f"subagent-startup-{handle.id}", daemon=True).start()
 	REGISTRY.emit()
 	return handle
-
-
-# Grouping (viewer support): the orchestrating agent labels phases before
-# spawning; agents spawned under a phase are grouped under it in the PTC viewer.
-# Phase state (label + start time) lives on the registry.
-
-
-def current_phase() -> str | None:
-	return REGISTRY.current_phase()
-
-
-def set_phase(label: str | None) -> None:
-	REGISTRY.set_phase(label)

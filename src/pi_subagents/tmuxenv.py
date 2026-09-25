@@ -50,14 +50,13 @@ def _slug(name: str) -> str:
 
 
 def unique_socket_name(name: str) -> str:
-	"""Pick a PI_SOCK_NAME that does not collide with an existing socket."""
+	"""Allocate a collision-resistant PI_SOCK_NAME independent of socket timing."""
 	base = f"subagent-{_slug(name)}"
-	sdir = socket_dir()
-	if not (sdir / f"{base}.sock").exists():
-		return base
+	# The old base-name-first strategy raced when two windows were submitted before
+	# either socket bound. Every allocation now receives an opaque suffix.
 	for _ in range(64):
-		candidate = f"{base}-{secrets.token_hex(2)}"
-		if not (sdir / f"{candidate}.sock").exists():
+		candidate = f"{base}-{secrets.token_hex(4)}"
+		if not (socket_dir() / f"{candidate}.sock").exists():
 			return candidate
 	raise RuntimeError("could not allocate a unique pi-sock socket name")
 
@@ -80,6 +79,7 @@ def spawn_pi_window(
 	socket_name: str,
 	depth: int,
 	profile: str | os.PathLike[str] | None = None,
+	session_name: str | None = None,
 ) -> "WindowRef":
 	"""Create a tmux window running an interactive pi instance with a prompt.
 
@@ -95,7 +95,7 @@ def spawn_pi_window(
 		prompt,
 		model=model,
 		thinking=thinking,
-		session_name=subagent_session_name(name),
+		session_name=subagent_session_name(session_name or name),
 	)
 	args = [
 		"new-window",

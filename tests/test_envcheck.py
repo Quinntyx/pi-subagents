@@ -74,3 +74,37 @@ def test_schema_validation_subset():
 		validate_with_schema(schema, {"a": 1, "c": 2})
 	with pytest.raises(SchemaValidationError):
 		validate_with_schema(schema, {"a": "not-int"})
+
+
+def test_schema_fallback_validator_handles_all_types(monkeypatch):
+	"""Without jsonschema installed, the built-in subset validator must work
+	for every supported type (a boolean schema value once crashed it).""
+	for every supported type (a boolean schema value once crashed it)."""
+
+	schema = {
+		"type": "object",
+		"required": ["flag", "n", "s", "items", "nothing"],
+		"additionalProperties": False,
+		"properties": {
+			"flag": {"type": "boolean"},
+			"n": {"type": "integer"},
+			"s": {"type": "string"},
+			"items": {"type": "array", "items": {"type": "string"}},
+			"nothing": {"type": "null"},
+		},
+	}
+	value = {"flag": True, "n": 2, "s": "x", "items": ["a"], "nothing": None}
+	import builtins
+	real_import = builtins.__import__
+
+	def no_jsonschema(name, *args, **kwargs):
+		if name == "jsonschema":
+			raise ImportError("hidden for the fallback test")
+		return real_import(name, *args, **kwargs)
+
+	monkeypatch.setattr(builtins, "__import__", no_jsonschema)
+	validate_with_schema(schema, value)
+	with pytest.raises(SchemaValidationError):
+		validate_with_schema(schema, {**value, "flag": "yes"})
+	with pytest.raises(SchemaValidationError):
+		validate_with_schema(schema, {**value, "extra": 1})

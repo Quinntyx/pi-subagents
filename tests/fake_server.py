@@ -10,6 +10,7 @@ import json
 import os
 import socket
 import threading
+import itertools
 
 
 class FakePiSockServer:
@@ -82,4 +83,7 @@ class FakePiSockServer:
 			return {"type": "response", "command": ctype, "success": True, "data": {"delivered": True, "mode": "direct"}}
 		if ctype in ("abort", "subscribe"):
 			return {"type": "response", "command": ctype, "success": True, "data": {}}
+		if ctype == "set_session_name":
+			self.sent.append(command)
+			return {"type": "response", "command": ctype, "success": True, "data": {"renamed": command.get("name")}}
 		return {"type": "response", "command": ctype, "success": False, "error": "unsupported"}
