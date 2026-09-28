@@ -26,7 +26,7 @@ google           gemini-2.5-computer-use-preview        131.1K   65.5K    yes   
 
 @pytest.fixture()
 def fake_pi(tmp_path, monkeypatch):
-    """A `pi` on PATH that prints FAKE_TABLE, plus a profile dir with settings."""
+    """A `pi` on PATH that prints FAKE_TABLE, plus an agent dir with settings."""
     profile = tmp_path / "profile"
     profile.mkdir()
     (profile / "settings.json").write_text(
@@ -97,11 +97,11 @@ def test_best_match_prefers_default_provider_then_first_party(fake_pi):
     assert catalog.best_model_match("opencode/gpt-6-astra").slug == "opencode/gpt-6-astra"
 
 
-def test_thinking_levels_and_profile_scoping(fake_pi):
+def test_thinking_levels_and_agent_dir_scoping(fake_pi):
     assert catalog.thinking_levels()[0] == "off"
     assert "xhigh" in catalog.thinking_levels()
     assert catalog.scoped_models() == ["deepseek-router/deepseek-v4.1-flash"]
-    defaults = catalog.profile_defaults()
+    defaults = catalog.agent_dir_defaults()
     assert defaults["slug"] == "deepseek-router/deepseek-v4.1-flash"
     assert defaults["thinking"] == "high"
 

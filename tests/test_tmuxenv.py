@@ -83,11 +83,11 @@ def test_missing_agent_dir_raises(monkeypatch, tmp_path):
 		tmuxenv.spawn_pi_window(
 			"prompt", name="x", cwd=str(tmp_path), window_name="x",
 			model=None, thinking=None, socket_name="subagent-x", depth=1,
-			profile=str(tmp_path / "nope"),
+			agentDir=str(tmp_path / "nope"),
 		)
 
 
-def test_resolve_profile(monkeypatch, tmp_path):
+def test_resolve_agent_dir(monkeypatch, tmp_path):
 	import pi_subagents.envcheck as envcheck
 
 	envcheck.placement = envcheck.TmuxPlacement("sess", "$0", "@1", "%0", "sock")
@@ -97,36 +97,36 @@ def test_resolve_profile(monkeypatch, tmp_path):
 	default_dir = tmp_path / "subagents"
 	default_dir.mkdir()
 	monkeypatch.setenv("PI_CODING_SUBAGENT_DIR", str(default_dir))
-	assert tmuxenv.resolve_profile(None) == default_dir
+	assert tmuxenv.resolve_agent_dir(None) == default_dir
 
 	# None without the env → the parent's own agent dir (PI_CODING_AGENT_DIR
 	# if set, else ~/.pi/agent) — zero-setup default: subagents share the
 	# orchestrator's config.
 	monkeypatch.delenv("PI_CODING_SUBAGENT_DIR")
 	monkeypatch.setenv("PI_CODING_AGENT_DIR", str(default_dir))
-	assert tmuxenv.resolve_profile(None) == default_dir
+	assert tmuxenv.resolve_agent_dir(None) == default_dir
 	monkeypatch.delenv("PI_CODING_AGENT_DIR")
 	monkeypatch.setenv("HOME", str(tmp_path))
-	assert tmuxenv.resolve_profile(None) == tmp_path / ".pi" / "agent"
+	assert tmuxenv.resolve_agent_dir(None) == tmp_path / ".pi" / "agent"
 
 	# bare name → ~/.config/pi/profiles/<name> (may not exist on the test host,
 	# so stub PROFILES_ROOT)
 	named_dir = tmp_path / "design-subagents"
 	named_dir.mkdir()
 	monkeypatch.setattr(tmuxenv, "PROFILES_ROOT", tmp_path)
-	assert tmuxenv.resolve_profile("design-subagents") == named_dir
+	assert tmuxenv.resolve_agent_dir("design-subagents") == named_dir
 
 	# explicit path wins as-is; missing dir raises
 	explicit = tmp_path / "elsewhere"
 	explicit.mkdir()
-	assert tmuxenv.resolve_profile(str(explicit)) == explicit
+	assert tmuxenv.resolve_agent_dir(str(explicit)) == explicit
 	with pytest.raises(RuntimeError, match="agent dir not found"):
-		tmuxenv.resolve_profile("no-such-profile")
+		tmuxenv.resolve_agent_dir("no-such-agent-dir")
 
 
-def test_spawn_profile_kwarg_threads_through(monkeypatch, tmp_path):
-	"""spawn_pi_window(profile=...) must stamp PI_CODING_AGENT_DIR with that
-	profile dir (captured via the tmux command args)."""
+def test_spawn_agentdir_kwarg_threads_through(monkeypatch, tmp_path):
+	"""spawn_pi_window(agentDir=...) must stamp PI_CODING_AGENT_DIR with that
+	agent dir (captured via the tmux command args)."""
 	import pi_subagents.envcheck as envcheck
 
 	envcheck.placement = envcheck.TmuxPlacement("sess", "$0", "@1", "%0", "sock")
@@ -143,6 +143,6 @@ def test_spawn_profile_kwarg_threads_through(monkeypatch, tmp_path):
 	tmuxenv.spawn_pi_window(
 		"prompt", name="x", cwd=str(tmp_path), window_name="x",
 		model=None, thinking=None, socket_name="subagent-x", depth=1,
-		profile=str(design_dir),
+		agentDir=str(design_dir),
 	)
 	assert f"PI_CODING_AGENT_DIR={design_dir}" in _args

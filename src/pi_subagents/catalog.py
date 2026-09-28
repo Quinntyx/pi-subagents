@@ -1,8 +1,8 @@
 """Model/thinking catalog for subagents.
 
 Answers "what can a subagent run on?" without guessing slugs. The catalog comes
-from the pi CLI as seen by the *subagent* profile (`pi --list-models`), so it
-reflects exactly what a spawned instance can resolve, and the profile's settings
+from the pi CLI as seen by a *spawned subagent* (`pi --list-models` under the subagent agent dir), so it
+reflects exactly what a spawned instance can resolve, and the agent dir's settings
 supply the defaults and the picker-scoped model list.
 """
 
@@ -27,7 +27,7 @@ __all__ = [
     "resolve_models",
     "best_model_match",
     "thinking_levels",
-    "profile_defaults",
+    "agent_dir_defaults",
     "scoped_models",
     "capabilities",
 ]
@@ -201,7 +201,7 @@ def resolve_models(query: str, *, refresh: bool = False) -> list[ModelInfo]:
 def best_model_match(query: str, *, refresh: bool = False) -> ModelInfo | None:
     """Single best match for a loose model name, or None when nothing matches.
 
-    Ordering prefers: an exact slug, then the profile's own default provider, then
+    Ordering prefers: an exact slug, then the agent dir's own default provider, then
     first-party entries (no `~` proxy prefix), then catalog order — so "astra"
     resolves to `openai-codex/gpt-6-astra` rather than a proxied variant.
     """
@@ -216,7 +216,7 @@ def best_model_match(query: str, *, refresh: bool = False) -> ModelInfo | None:
     if exact:
         return exact[0]
 
-    default_provider = profile_defaults().get("provider")
+    default_provider = agent_dir_defaults().get("provider")
 
     def rank(model: ModelInfo) -> tuple[int, int, str]:
         scored = 0
@@ -234,7 +234,7 @@ def thinking_levels() -> list[str]:
     return list(THINKING_LEVELS)
 
 
-def _profile_settings() -> dict[str, Any]:
+def _agent_dir_settings() -> dict[str, Any]:
     path = subagent_agent_dir() / "settings.json"
     try:
         with open(path, encoding="utf-8") as handle:
@@ -244,14 +244,14 @@ def _profile_settings() -> dict[str, Any]:
         return {}
 
 
-def profile_defaults() -> dict[str, Any]:
+def agent_dir_defaults() -> dict[str, Any]:
     """What a spawned subagent uses when no model/thinking is passed."""
-    settings = _profile_settings()
+    settings = _agent_dir_settings()
     provider = settings.get("defaultProvider")
     model = settings.get("defaultModel")
     default_slug = f"{provider}/{model}" if provider and model else (model or None)
     return {
-        "profile": str(subagent_agent_dir()),
+        "agentDir": str(subagent_agent_dir()),
         "provider": provider,
         "model": model,
         "slug": default_slug,
@@ -260,26 +260,26 @@ def profile_defaults() -> dict[str, Any]:
 
 
 def scoped_models() -> list[str]:
-    """The profile's picker/enabled model list (`enabledModels`).
+    """The agent dir's picker/enabled model list (`enabledModels`).
 
-    This is what the profile cycles through interactively; `agent(model=...)` may
+    This is what the picker cycles through interactively; `agent(model=...)` may
     still use any slug from `list_models()` because spawns pass `--model`.
     """
-    scoped = _profile_settings().get("enabledModels")
+    scoped = _agent_dir_settings().get("enabledModels")
     return [str(entry) for entry in scoped] if isinstance(scoped, list) else []
 
 
 def capabilities(*, include_models: bool = False) -> dict[str, Any]:
     """One call that answers "what can subagents run with?".
 
-    Combines the live catalog summary, the profile's defaults, the picker-scoped
+    Combines the live catalog summary, the agent dir's defaults, the picker-scoped
     list, and the runtime caps. The full catalog is ~600 entries, so it is only
     returned when `include_models=True`; use `list_models(search)` for specifics.
     """
-    defaults = profile_defaults()
+    defaults = agent_dir_defaults()
     models = list_models()
     result: dict[str, Any] = {
-        "profile": defaults["profile"],
+        "agentDir": defaults["agentDir"],
         "default_model": defaults["slug"],
         "default_thinking": defaults["thinking"],
         "thinking_levels": thinking_levels(),

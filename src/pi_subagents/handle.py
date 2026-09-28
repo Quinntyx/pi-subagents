@@ -700,7 +700,7 @@ def spawn_pi_window_handle(
 	model: str | None = None,
 	thinking: str | None = None,
 	schema: dict | None = None,
-	profile: str | os.PathLike[str] | None = None,
+	agentDir: str | os.PathLike[str] | None = None,
 	group: str | None = None,
 	session_name: str | None = None,
 	register: bool = True,
@@ -725,7 +725,7 @@ def spawn_pi_window_handle(
 		thinking=handle.thinking,
 		socket_name=handle.id,
 		depth=depth,
-		profile=profile,
+		agentDir=agentDir,
 		session_name=session_name,
 	)
 	handle.group = group

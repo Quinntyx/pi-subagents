@@ -23,7 +23,10 @@ class Task:
 	thinking: str | None = None
 	schema: dict | None = None
 	cwd: str | os.PathLike[str] | None = None
-	profile: str | os.PathLike[str] | None = None
+	# Agent dir for spawned instances: bare name under the pi-profiles root,
+	# or a path used verbatim. None → PI_CODING_SUBAGENT_DIR or the
+	# orchestrator's own agent dir.
+	agentDir: str | os.PathLike[str] | None = None
 	timeout: float | None = None
 	metadata: Mapping[str, Any] = field(default_factory=dict)
 	_explicit_metadata: frozenset[str] = field(init=False, repr=False, compare=False)
@@ -45,8 +48,8 @@ class Task:
 		object.__setattr__(self, "_explicit_metadata", explicit)
 		if self.cwd is not None:
 			object.__setattr__(self, "cwd", os.fspath(self.cwd))
-		if self.profile is not None:
-			object.__setattr__(self, "profile", os.fspath(self.profile))
+		if self.agentDir is not None:
+			object.__setattr__(self, "agentDir", os.fspath(self.agentDir))
 
 	def with_parent_metadata(self, parent: Mapping[str, Any]) -> "Task":
 		"""Return a task whose metadata inherits from a parent result.
@@ -64,7 +67,7 @@ class Task:
 			thinking=self.thinking,
 			schema=self.schema,
 			cwd=self.cwd,
-			profile=self.profile,
+			agentDir=self.agentDir,
 			timeout=self.timeout,
 			metadata=merged,
 		)

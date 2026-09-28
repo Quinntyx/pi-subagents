@@ -1,7 +1,7 @@
 """pi-subagents — pool-based orchestration of standalone pi instances.
 
 Subagents are real, interactive pi processes running in their own tmux windows
-(under the dedicated `subagents` pi profile), controlled over the pi-sock unix
+(running under the orchestrator's agent dir or `PI_CODING_SUBAGENT_DIR`), controlled over the pi-sock unix
 socket. The library works both inside a PTC session (state is forwarded to the
 PTC runtime as `subagent_state` frames for live UI) and from plain scripts run
 directly in a tmux pane (state is printed as one-line status updates).
@@ -28,7 +28,7 @@ from .catalog import (
 	capabilities,
 	list_models,
 	model_slugs,
-	profile_defaults,
+	agent_dir_defaults,
 	resolve_models,
 	scoped_models,
 	thinking_levels,
@@ -65,7 +65,7 @@ __all__ = [
 	"resolve_models",
 	"best_model_match",
 	"thinking_levels",
-	"profile_defaults",
+	"agent_dir_defaults",
 	"scoped_models",
 	"AgentSession",
 	"AgentStrResponse",

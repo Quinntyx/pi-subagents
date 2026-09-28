@@ -108,7 +108,7 @@ def instant_factory(tmp_path, monkeypatch):
 	factory = FakeLiveFactory(tmp_path)
 
 	def spawn(prompt, *, name=None, cwd=None, window_name=None, model=None, thinking=None,
-	          schema=None, profile=None, group=None, session_name=None, register=False):
+	          schema=None, agentDir=None, group=None, session_name=None, register=False):
 		live = factory.make(prompt, name=name, cwd=cwd, model=model, schema=schema)
 		live.group = group
 		factory.renamed.append((name or "", session_name or ""))

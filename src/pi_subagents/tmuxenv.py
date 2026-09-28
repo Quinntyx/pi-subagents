@@ -38,7 +38,7 @@ def subagent_agent_dir() -> Path:
 	return Path(env).expanduser() if env else parent_agent_dir()
 
 
-def resolve_profile(profile: str | os.PathLike[str] | None) -> Path:
+def resolve_agent_dir(agent_dir: str | os.PathLike[str] | None) -> Path:
 	"""Resolve the agent dir a spawned subagent runs under.
 
 	None → PI_CODING_SUBAGENT_DIR or the parent's agent dir (see
@@ -47,13 +47,13 @@ def resolve_profile(profile: str | os.PathLike[str] | None) -> Path:
 	that directory, used verbatim as the agent dir. Raises when the resolved
 	directory does not exist.
 	"""
-	explicit = profile is not None or "PI_CODING_SUBAGENT_DIR" in os.environ
-	if profile is None:
+	explicit = agent_dir is not None or "PI_CODING_SUBAGENT_DIR" in os.environ
+	if agent_dir is None:
 		candidate = subagent_agent_dir()
 	else:
-		candidate = Path(profile).expanduser()
-		if not candidate.is_absolute() and "/" not in str(profile) and "\\" not in str(profile):
-			candidate = PROFILES_ROOT / profile
+		candidate = Path(agent_dir).expanduser()
+		if not candidate.is_absolute() and "/" not in str(agent_dir) and "\\" not in str(agent_dir):
+			candidate = PROFILES_ROOT / agent_dir
 	# Only explicitly configured dirs are validated: the default is the
 	# parent's own agent dir, which exists by construction (pi is running
 	# out of it), and a missing-dir error there would be pure noise.
@@ -100,19 +100,19 @@ def spawn_pi_window(
 	thinking: str | None,
 	socket_name: str,
 	depth: int,
-	profile: str | os.PathLike[str] | None = None,
+	agentDir: str | os.PathLike[str] | None = None,
 	session_name: str | None = None,
 ) -> "WindowRef":
 	"""Create a tmux window running an interactive pi instance with a prompt.
 
 	Returns a WindowRef (window id + socket path). Raises on tmux failure.
-	`profile` selects the agent dir subagents run under: a bare name under
+	`agentDir` selects the agent dir subagents run under: a bare name under
 	the pi-profiles root, or a path used verbatim; None → PI_CODING_SUBAGENT_DIR
 	or the parent's own agent dir.
 	"""
 	placement = require_environment()
 	sock_path = socket_dir() / f"{socket_name}.sock"
-	profile_dir = resolve_profile(profile)
+	agent_dir_resolved = resolve_agent_dir(agentDir)
 
 	pi_cmd = _build_pi_command(
 		prompt,
@@ -131,7 +131,7 @@ def spawn_pi_window(
 		"-n",
 		window_name,
 		"-e",
-		f"PI_CODING_AGENT_DIR={profile_dir}",
+		f"PI_CODING_AGENT_DIR={agent_dir_resolved}",
 		"-e",
 		f"PI_SOCK_NAME={socket_name}",
 		"-e",

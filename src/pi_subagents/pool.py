@@ -643,7 +643,7 @@ class AgentPool:
 			"model": task.model,
 			"thinking": task.thinking,
 			"cwd": os.path.abspath(task.cwd) if task.cwd else None,
-			"profile": os.path.abspath(task.profile) if task.profile else None,
+			"agentDir": os.path.abspath(task.agentDir) if task.agentDir else None,
 		}
 		for field, requested in checks.items():
 			if requested is not None and requested != config.get(field):
@@ -768,7 +768,7 @@ class AgentPool:
 
 		task = job.task
 		cwd = os.path.abspath(task.cwd or os.getcwd())
-		profile = os.path.abspath(task.profile) if task.profile else None
+		agent_dir = os.path.abspath(task.agentDir) if task.agentDir else None
 		live = spawn_pi_window_handle(
 			task.prompt,
 			name=job.handle.name,
@@ -777,7 +777,7 @@ class AgentPool:
 			model=task.model,
 			thinking=task.thinking,
 			schema=task.schema,
-			profile=profile,
+			agentDir=agent_dir,
 			group=job.stage.name,
 			session_name=job.session_name,
 			register=False,
@@ -786,7 +786,7 @@ class AgentPool:
 			"model": task.model,
 			"thinking": task.thinking,
 			"cwd": cwd,
-			"profile": profile,
+			"agentDir": agent_dir,
 		}
 		return live, config
 
