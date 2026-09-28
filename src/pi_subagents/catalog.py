@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .envcheck import require_environment
-from .tmuxenv import subagent_profile_dir
+from .tmuxenv import subagent_agent_dir
 
 __all__ = [
     "ModelInfo",
@@ -143,7 +143,7 @@ def list_models(search: str | None = None, *, refresh: bool = False) -> list[Mod
         if cached is not None and (time.monotonic() - cached[0]) < _catalog_ttl():
             return list(cached[1])
 
-    env = {**os.environ, "PI_CODING_AGENT_DIR": str(subagent_profile_dir())}
+    env = {**os.environ, "PI_CODING_AGENT_DIR": str(subagent_agent_dir())}
     command = [_pi_command(), "--list-models"]
     if search:
         command.append(search)
@@ -235,7 +235,7 @@ def thinking_levels() -> list[str]:
 
 
 def _profile_settings() -> dict[str, Any]:
-    path = subagent_profile_dir() / "settings.json"
+    path = subagent_agent_dir() / "settings.json"
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
@@ -251,7 +251,7 @@ def profile_defaults() -> dict[str, Any]:
     model = settings.get("defaultModel")
     default_slug = f"{provider}/{model}" if provider and model else (model or None)
     return {
-        "profile": str(subagent_profile_dir()),
+        "profile": str(subagent_agent_dir()),
         "provider": provider,
         "model": model,
         "slug": default_slug,

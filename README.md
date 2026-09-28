@@ -1,9 +1,13 @@
 # pi-subagents
 
+> [!NOTE]
+> **Upstream:** the canonical, community-facing home of this project is [github.com/Quinntyx/pi-subagents](https://github.com/Quinntyx/pi-subagents). This git.quinntyx.dev copy is the author's development fork — day-to-day churn lands here and is PR'd to GitHub on release. Install instructions below point at GitHub.
+
 Pool-based orchestration of standalone pi instances from Python.
 
 Subagents are real, interactive pi processes running in their own tmux windows
-(under the dedicated `subagents` pi profile), controlled over the pi-sock unix
+(running under your own agent dir by default — see `PI_CODING_SUBAGENT_DIR`
+below), controlled over the pi-sock unix
 socket. The library works both inside a PTC session (state is forwarded to the
 PTC runtime as `subagent_state` frames for live UI) and from plain scripts run
 directly in a tmux pane (state is printed as one-line status updates).
@@ -119,7 +123,7 @@ so an ungated build→review→fix cycle runs forever.
 
 ## Choosing a model or effort level
 
-The subagent profile can reach **every** model its pi install knows, so **never
+Each subagent runs with the agent dir resolved above, so it can reach **every** model its pi install knows, so **never
 guess a slug and never refuse a named model** — look it up:
 
 ```python
@@ -152,7 +156,7 @@ against a main agent's `π - Vault`. The tmux window keeps the short agent name.
 - `PI_SUBAGENTS_STARTUP_TIMEOUT` (90 s) — pi-sock readiness + first delivery.
 - `PI_SUBAGENTS_SCHEMA_RETRIES` (3) — JSON repair rounds for schema tasks.
 - `PI_SUBAGENTS_CATALOG_TTL` (120 s) — model-catalog cache lifetime.
-- `PI_SUBAGENTS_PROFILE` — default subagent pi profile directory.
+- `PI_CODING_SUBAGENT_DIR` — the agent dir spawned subagents run under. Unset, subagents share the orchestrator's own agent dir (`PI_CODING_AGENT_DIR` or `~/.pi/agent`) — zero setup. Point it at any directory with a pi config (including a pi-profiles-managed profile) for a separate subagent environment.
 
 ## Rules
 

@@ -15,28 +15,50 @@ from .envcheck import require_environment, tmux
 
 SOCK_DIR = Path.home() / ".pi" / "pi-sock"
 PROFILES_ROOT = Path.home() / ".config" / "pi" / "profiles"
-DEFAULT_PROFILE = PROFILES_ROOT / "subagents"
 
 
-def subagent_profile_dir() -> Path:
-	return Path(os.environ.get("PI_SUBAGENTS_PROFILE", str(DEFAULT_PROFILE)))
+def parent_agent_dir() -> Path:
+	"""The agent dir this orchestrating pi instance runs under.
+
+	PI_CODING_AGENT_DIR if set, else pi's default ~/.pi/agent.
+	"""
+	env = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
+	return Path(env).expanduser() if env else Path.home() / ".pi" / "agent"
+
+
+def subagent_agent_dir() -> Path:
+	"""Agent dir spawned subagent pi instances run under.
+
+	PI_CODING_SUBAGENT_DIR wins when set (any directory with a pi config —
+	pi-profiles-managed or a hand-rolled copy). Default: the parent's own
+	agent dir, so installing pi-subagents works with zero setup — subagents
+	share the orchestrator's config, extensions (pi-sock!), and auth.
+	"""
+	env = os.environ.get("PI_CODING_SUBAGENT_DIR", "").strip()
+	return Path(env).expanduser() if env else parent_agent_dir()
 
 
 def resolve_profile(profile: str | os.PathLike[str] | None) -> Path:
-	"""Resolve a profile kwarg to a pi profile directory.
+	"""Resolve the agent dir a spawned subagent runs under.
 
-	None → the default subagent profile (PI_SUBAGENTS_PROFILE or subagents).
-	A bare name → ~/.config/pi/profiles/<name>; an absolute/relative path →
-	that directory. Raises when the directory does not exist.
+	None → PI_CODING_SUBAGENT_DIR or the parent's agent dir (see
+	subagent_agent_dir). A bare name → <pi-profiles-root>/<name> (pi-profiles
+	layout, e.g. ~/.config/pi/profiles/subagents); an absolute/relative path →
+	that directory, used verbatim as the agent dir. Raises when the resolved
+	directory does not exist.
 	"""
+	explicit = profile is not None or "PI_CODING_SUBAGENT_DIR" in os.environ
 	if profile is None:
-		candidate = subagent_profile_dir()
+		candidate = subagent_agent_dir()
 	else:
-		candidate = Path(profile)
+		candidate = Path(profile).expanduser()
 		if not candidate.is_absolute() and "/" not in str(profile) and "\\" not in str(profile):
 			candidate = PROFILES_ROOT / profile
-	if not candidate.is_dir():
-		raise RuntimeError(f"subagent pi profile not found: {candidate}")
+	# Only explicitly configured dirs are validated: the default is the
+	# parent's own agent dir, which exists by construction (pi is running
+	# out of it), and a missing-dir error there would be pure noise.
+	if explicit and not candidate.is_dir():
+		raise RuntimeError(f"subagent agent dir not found: {candidate}")
 	return candidate
 
 
@@ -84,8 +106,9 @@ def spawn_pi_window(
 	"""Create a tmux window running an interactive pi instance with a prompt.
 
 	Returns a WindowRef (window id + socket path). Raises on tmux failure.
-	`profile` selects the pi profile: a name under ~/.config/pi/profiles or a
-	path; None → the default subagent profile.
+	`profile` selects the agent dir subagents run under: a bare name under
+	the pi-profiles root, or a path used verbatim; None → PI_CODING_SUBAGENT_DIR
+	or the parent's own agent dir.
 	"""
 	placement = require_environment()
 	sock_path = socket_dir() / f"{socket_name}.sock"

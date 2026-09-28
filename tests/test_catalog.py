@@ -60,7 +60,7 @@ def fake_pi(tmp_path, monkeypatch):
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
 
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
-    monkeypatch.setenv("PI_SUBAGENTS_PROFILE", str(profile))
+    monkeypatch.setenv("PI_CODING_SUBAGENT_DIR", str(profile))
     catalog._CACHE.clear()
     yield
     catalog._CACHE.clear()
