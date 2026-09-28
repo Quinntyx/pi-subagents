@@ -102,13 +102,15 @@ class Registry:
 					(
 						agent["id"], agent["status"], agent["toolCalls"], agent["thinkingMs"],
 						agent["label"], agent["awaited"], agent["ctx"], agent["group"],
+						agent.get("idle"), agent.get("busyMs"),
 					)
 					for agent in snapshot["agents"]
 				),
 				[
 					(
 						pool["id"], pool["running"], pool["queued"], pool["results"],
-						tuple((stage["id"], stage["queued"], stage["running"], stage["settled"], stage["failed"])
+						tuple((stage["id"], stage["queued"], stage["running"], stage["settled"], stage["failed"],
+						       stage.get("busyMs"), stage.get("activeSince"))
 						      for stage in pool["stages"]),
 					)
 					for pool in snapshot["pools"]

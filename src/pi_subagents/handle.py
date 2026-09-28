@@ -70,6 +70,12 @@ class AgentHandle:
 		# actual runtime instead of growing forever with the age of the handle.
 		runtime_ms: int | None = None
 		self.runtime_ms = runtime_ms
+		# Execution time excludes observed between-turn idle periods. The wall
+		# runtime above remains the task/result duration; these fields drive the
+		# live viewer's non-ticking idle state.
+		self._busy_ms = 0.0
+		self._busy_since: float | None = self.started_at
+		self._idle = False
 		self.status = "starting"
 		self.closed = False
 		self.group = None
@@ -192,22 +198,49 @@ class AgentHandle:
 
 	def _stamp_runtime(self) -> None:
 		"""Freeze the runtime the moment the agent stops running."""
+		now = time.time() * 1000
 		if self.runtime_ms is None:
-			self.runtime_ms = round((time.time() * 1000) - self.started_at)
+			self.runtime_ms = round(now - self.started_at)
+		if self._busy_since is not None:
+			self._busy_ms += max(0, now - self._busy_since)
+			self._busy_since = None
+
+	def _absorb_execution_state(self, state: dict | None) -> None:
+		"""Track whether pi is executing or idle between orchestrator turns."""
+		if not isinstance(state, dict) or "isIdle" not in state:
+			return
+		# hasPendingMessages means a delivered turn is waiting to start; it is not
+		# the retained-session, between-turn idle state shown by the viewer.
+		idle = bool(state.get("isIdle")) and not bool(state.get("hasPendingMessages"))
+		now = time.time() * 1000
+		if idle and not self._idle:
+			if self._busy_since is not None:
+				self._busy_ms += max(0, now - self._busy_since)
+				self._busy_since = None
+		elif not idle and self._idle and self.status in ("starting", "running"):
+			self._busy_since = now
+		self._idle = idle
+
+	def _busy_elapsed_ms(self) -> int:
+		busy = self._busy_ms
+		if self._busy_since is not None:
+			busy += max(0, time.time() * 1000 - self._busy_since)
+		return round(busy)
 
 	def agent_state(self) -> dict:
 		"""Compact snapshot row for the registry."""
-		elapsed = self.runtime_ms
-		if elapsed is None:
-			elapsed = round((time.time() * 1000) - self.started_at)
+		busy_ms = self._busy_elapsed_ms()
+		elapsed = self.runtime_ms if self.runtime_ms is not None else busy_ms
 		return {
 			"id": self.id,
 			"name": self.name,
 			"group": self.group,
 			"status": self.status,
+			"idle": self._idle and self.status == "running",
 			"execScope": self.exec_scope,
 			"startedAt": self.started_at,
 			"elapsedMs": round(elapsed),
+			"busyMs": busy_ms,
 			"socketPath": self.socket_path,
 			"windowId": self.window_id,
 			"toolCalls": self.tool_calls,
@@ -275,6 +308,9 @@ class AgentHandle:
 		self.settled_data = None
 		self.runtime_ms = None
 		self.started_at = time.time() * 1000
+		self._busy_ms = 0.0
+		self._busy_since = self.started_at
+		self._idle = False
 		if self._session is not None:
 			self._session.invalidate()
 		self._session = None
@@ -299,6 +335,9 @@ class AgentHandle:
 		self.settled_data = None
 		self.runtime_ms = None
 		self.started_at = time.time() * 1000
+		self._busy_ms = 0.0
+		self._busy_since = self.started_at
+		self._idle = False
 		if self._session is not None:
 			self._session.invalidate()
 		self._session = None
@@ -500,6 +539,7 @@ class AgentHandle:
 		return False
 
 	def _absorb_from_state(self, state: dict | None = None) -> None:
+		self._absorb_execution_state(state)
 		self._absorb_ctx(state)
 		try:
 			self.activity()
@@ -508,6 +548,7 @@ class AgentHandle:
 			pass
 
 	async def _absorb_from_state_async(self, state: dict | None = None) -> None:
+		self._absorb_execution_state(state)
 		self._absorb_ctx(state)
 		try:
 			await self.activity_async()

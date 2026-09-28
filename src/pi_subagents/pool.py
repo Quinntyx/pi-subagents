@@ -186,9 +186,11 @@ class AgentHandle:
 			"name": self.name,
 			"group": self.stage.name,
 			"status": self.status,
+			"idle": False,
 			"execScope": self.exec_scope,
 			"startedAt": self.started_at or self.pool.started_at,
 			"elapsedMs": round(elapsed or 0),
+			"busyMs": round(elapsed or 0),
 			"socketPath": None,
 			"windowId": None,
 			"toolCalls": 0,
@@ -206,7 +208,8 @@ class AgentHandle:
 			live = self._live.agent_state()
 			for key in (
 				"socketPath", "windowId", "toolCalls", "thinkingMs", "phase", "label",
-				"labelElapsedMs", "labelCalls", "liveTool", "ctx", "depth",
+				"labelElapsedMs", "labelCalls", "liveTool", "ctx", "depth", "idle",
+				"elapsedMs", "busyMs",
 			):
 				base[key] = live.get(key)
 		return base
@@ -249,6 +252,11 @@ class AgentStage:
 		self._settled = 0
 		self._failed = 0
 		self._cancelled = 0
+		# Busy time is the union of periods where this stage has at least one
+		# dispatched task. Unlike created_at wall time, it stops while the stage
+		# is idle between workflow passes.
+		self._busy_ms = 0.0
+		self._active_since: float | None = None
 
 	def submit(
 		self,
@@ -286,7 +294,20 @@ class AgentStage:
 			"failed": self._failed,
 			"cancelled": self._cancelled,
 			"startedAt": self.created_at,
+			"busyMs": round(self._busy_ms),
+			"activeSince": self._active_since,
 		}
+
+	def _started_running(self, now: float) -> None:
+		if self._running == 0:
+			self._active_since = now
+		self._running += 1
+
+	def _stopped_running(self, now: float) -> None:
+		self._running = max(0, self._running - 1)
+		if self._running == 0 and self._active_since is not None:
+			self._busy_ms += max(0, now - self._active_since)
+			self._active_since = None
 
 	def __repr__(self) -> str:
 		return f"<AgentStage {self.name!r} slots={self.slots}>"
@@ -358,6 +379,7 @@ class AgentPool:
 		self._reserved_sessions: dict[int, str] = {}
 		self._agent_ms = 0
 		self._tool_calls = 0
+		self.last_summary: PoolSummary | None = None
 		self._submit_sequence = 0
 		self._result_sequence = 0
 		self._running = 0
@@ -471,11 +493,13 @@ class AgentPool:
 		"""Invalidate handles, stop work, destroy every retained window, and close.
 
 		Returns the workflow report (PoolSummary) — echoed when close() is the
-		cell's last line, so ending a fan-out produces its own stats.
+		cell's last line, so ending a fan-out produces its own stats. The summary
+		is also stored as ``self.last_summary`` so `with`-statement users can read
+		it after the block.
 		"""
 		with self._condition:
 			if self._closed:
-				return PoolSummary(
+				summary = PoolSummary(
 					name=self.name,
 					submitted=self._submit_sequence,
 					settled=0,
@@ -487,6 +511,8 @@ class AgentPool:
 					stages={},
 					failures=(),
 				)
+				self.last_summary = summary
+				return summary
 			self._closed = True
 			handles = list(self._handles.values())
 			live_sessions = {id(handle._live): handle._live for handle in handles if handle._live}
@@ -504,7 +530,12 @@ class AgentPool:
 				for result in self._results
 				if result.status != "settled"
 			)
+			now = time.time() * 1000
 			for stage in self._stages:
+				# Workers abandoned by close() no longer represent active stage work.
+				if stage._active_since is not None:
+					stage._busy_ms += max(0, now - stage._active_since)
+					stage._active_since = None
 				stage._queue.clear()
 			self._results.clear()
 			for handle in handles:
@@ -526,7 +557,7 @@ class AgentPool:
 		REGISTRY.unregister_pool(self.id)
 		REGISTRY.emit()
 
-		return PoolSummary(
+		summary = PoolSummary(
 			name=self.name,
 			submitted=self._submit_sequence,
 			settled=sum(stage._settled for stage in self._stages),
@@ -538,12 +569,23 @@ class AgentPool:
 			stages=stages_summary,
 			failures=failures,
 		)
+		self.last_summary = summary
+		return summary
 
 	def __enter__(self) -> "AgentPool":
 		return self
 
-	def __exit__(self, exc_type, exc, tb) -> None:
-		self.close()
+	def __exit__(self, exc_type, exc, tb) -> bool:
+		"""Close the pool only when the block exits cleanly.
+
+		An exception must NOT damage the pool: running agents keep their windows,
+		pending results stay queued, and the caller can inspect state or continue
+		the run from a follow-up cell (then close explicitly). Returning False
+		lets the exception propagate.
+		"""
+		if exc_type is None:
+			self.close()
+		return False
 
 	def _submit(
 		self,
@@ -662,10 +704,11 @@ class AgentPool:
 				if stage is not None:
 					job = stage._queue.popleft()
 					job.dispatched = True
-					stage._running += 1
+					now = time.time() * 1000
+					stage._started_running(now)
 					self._running += 1
 					job.handle._status = "starting"
-					job.handle.started_at = time.time() * 1000
+					job.handle.started_at = now
 					return job
 				self._condition.wait()
 
@@ -764,7 +807,7 @@ class AgentPool:
 		handle.runtime_ms = round(now - handle.started_at) if handle.started_at else None
 		handle._status = status
 		if job.dispatched:
-			job.stage._running = max(0, job.stage._running - 1)
+			job.stage._stopped_running(now)
 			self._running = max(0, self._running - 1)
 		if status == "settled":
 			job.stage._settled += 1

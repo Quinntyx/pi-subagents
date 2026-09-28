@@ -163,6 +163,22 @@ def test_registry_prints_status_line_without_bridge(tmp_path, capsys):
 		server.close()
 
 
+def test_idle_state_freezes_busy_elapsed_time(tmp_path):
+	h = AgentHandle("p", name="idle", cwd=str(tmp_path), window_name="idle", model=None, thinking=None, schema=None)
+	h.status = "running"
+	time.sleep(0.01)
+	h._absorb_execution_state({"isIdle": True, "hasPendingMessages": False})
+	first = h.agent_state()
+	time.sleep(0.02)
+	second = h.agent_state()
+	assert first["idle"] is True
+	assert second["elapsedMs"] == first["elapsedMs"]
+
+	h._absorb_execution_state({"isIdle": False, "hasPendingMessages": False})
+	time.sleep(0.02)
+	assert h.agent_state()["elapsedMs"] > second["elapsedMs"]
+
+
 def test_activity_absorbed_into_handle_state(tmp_path):
 	h = AgentHandle("p", name="t9", cwd=str(tmp_path), window_name="t9", model=None, thinking=None, schema=None)
 	server = bind_handle(h, tmp_path)
