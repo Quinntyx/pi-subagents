@@ -43,16 +43,26 @@ class PiSockSessionEnded(PiSockError):
 	"""
 
 
+class PiSockTurnFailed(PiSockError):
+	"""The agent's last run failed at the provider (quota exhausted, rate
+	limit, API error — session entry with ``stopReason: "error"``).
+
+	The turn settles (pi goes idle), but treating it as a clean result lets a
+	workflow silently drain on a dead agent. Raised instead, carrying the
+	session's ``errorMessage`` when present.
+	"""
+
+
 def socket_path_for(name: str) -> str:
 	return os.path.join(os.environ.get("PI_SOCK_DIR", SOCK_DIR), f"{name}.sock")
 
 
-def _last_stop_reason(session_file: str | None) -> str | None:
-	"""Best-effort stopReason of the session's last assistant message.
+def _last_assistant_outcome(session_file: str | None) -> tuple[str, str | None] | None:
+	"""Best-effort (stopReason, errorMessage) of the session's last assistant entry.
 
 	Reads a small tail of the session JSONL (same machine as the subagent).
-	Returns None when the file is unavailable or the field is absent, so older
-	pi-sock versions simply keep the old settle semantics.
+	Returns None when the file is unavailable or no stopReason is present, so
+	older pi versions simply keep the old settle semantics.
 	"""
 	if not session_file or not os.path.exists(session_file):
 		return None
@@ -67,9 +77,44 @@ def _last_stop_reason(session_file: str | None) -> str | None:
 	for line in reversed(tail.splitlines()):
 		if '"role":"assistant"' not in line and '"role": "assistant"' not in line:
 			continue
-		match = re.search(r'"stopReason"\s*:\s*"([a-z]+)"', line)
-		return match.group(1) if match else None
+		stop_match = re.search(r'"stopReason"\s*:\s*"([a-z]+)"', line)
+		if not stop_match:
+			return None
+		error_match = re.search(r'"errorMessage"\s*:\s*"((?:[^"\\]|\\.)*)"', line)
+		error_message = None
+		if error_match:
+			try:
+				error_message = json.loads('"' + error_match.group(1) + '"')
+			except Exception:
+				error_message = error_match.group(1)
+		return stop_match.group(1), error_message
 	return None
+
+
+def raise_for_failed_outcome(session_file: str | None) -> None:
+	"""Raise when the session's last assistant entry ended abnormally.
+
+	- stopReason "aborted": the user interrupted the turn.
+	- Any other non-success terminal reason ("error", ...): the run failed at
+	  the provider — quota exhausted, rate limit, API error.
+
+	Both bubble immediately as errors instead of settling cleanly, so a
+	workflow cannot silently drain on a dead agent. "stop", "toolUse",
+	"length", "pending" and "deferred" are treated as successful settles.
+	"""
+	outcome = _last_assistant_outcome(session_file)
+	if outcome is None:
+		return
+	stop, error_message = outcome
+	detail = f": {error_message}" if error_message else ""
+	if stop == "aborted":
+		raise PiSockSessionEnded(
+			f"pi session's last turn was interrupted (stopReason=aborted){detail}"
+		)
+	if stop not in ("stop", "toolUse", "length", "pending", "deferred"):
+		raise PiSockTurnFailed(
+			f"agent run failed at the provider (stopReason={stop}{detail})"
+		)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +215,7 @@ class SockClient:
 		deadline = (time.monotonic() + timeout) if timeout is not None else None
 		saw_running = False
 		saw_settle = False
+		outcome_checked = False
 		while True:
 			if self.sock_path and not os.path.exists(self.sock_path):
 				raise PiSockSessionEnded(
@@ -183,15 +229,20 @@ class SockClient:
 				) from error
 			if not state.get("isIdle"):
 				saw_running = True
+				outcome_checked = False
 			elif not state.get("hasPendingMessages"):
+				# Idle with nothing queued: the run has ended — completed, errored,
+				# or interrupted. Check the terminal outcome ONCE per run before the
+				# settle test: a provider failure that produced no text content is
+				# filtered out of get_message, so the settle condition below may
+				# never fire and the wait would silently run out its timeout.
+				if not outcome_checked:
+					outcome_checked = True
+					raise_for_failed_outcome(state.get("sessionFile"))
 				last = self.message()
 				if last is not None and (saw_running or last != after_message):
 					saw_settle = True
 			if saw_settle:
-				if _last_stop_reason(state.get("sessionFile")) == "aborted":
-					raise PiSockSessionEnded(
-						"pi session's last turn was interrupted (stopReason=aborted)"
-					)
 				return {"lastAssistant": last, "isIdle": True}
 			if on_tick is not None:
 				on_tick(state)
@@ -301,6 +352,7 @@ class AsyncSockClient:
 		deadline = (time.monotonic() + timeout) if timeout is not None else None
 		saw_running = False
 		saw_settle = False
+		outcome_checked = False
 		while True:
 			if self.sock_path and not os.path.exists(self.sock_path):
 				raise PiSockSessionEnded(
@@ -314,15 +366,20 @@ class AsyncSockClient:
 				) from error
 			if not state.get("isIdle"):
 				saw_running = True
+				outcome_checked = False
 			elif not state.get("hasPendingMessages"):
+				# Idle with nothing queued: the run has ended — completed, errored,
+				# or interrupted. Check the terminal outcome ONCE per run before the
+				# settle test: a provider failure that produced no text content is
+				# filtered out of get_message, so the settle condition below may
+				# never fire and the wait would silently run out its timeout.
+				if not outcome_checked:
+					outcome_checked = True
+					raise_for_failed_outcome(state.get("sessionFile"))
 				last = await self.message()
 				if last is not None and (saw_running or last != after_message):
 					saw_settle = True
 			if saw_settle:
-				if _last_stop_reason(state.get("sessionFile")) == "aborted":
-					raise PiSockSessionEnded(
-						"pi session's last turn was interrupted (stopReason=aborted)"
-					)
 				return {"lastAssistant": last, "isIdle": True}
 			if on_tick is not None:
 				result = on_tick(state)

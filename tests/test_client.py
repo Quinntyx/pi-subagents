@@ -16,6 +16,7 @@ from fake_server import FakePiSockServer  # noqa: E402
 from pi_subagents.client import (
 	PiSockError,
 	PiSockSessionEnded,
+	PiSockTurnFailed,
 	PiSockUnavailable,
 	SockClient,
 )  # noqa: E402
@@ -118,7 +119,7 @@ def test_wait_settled_socket_lost_midwait_raises(sock_env):
 def test_wait_settled_interrupted_turn_raises(sock_env, tmp_path):
 	# last assistant message in the session file has stopReason "aborted": the
 	# user interrupted the agent; that must NOT settle as a clean result
-	session_file = tmp_path / "session.jsonl"
+	session_file = tmp_path / "session-abort.jsonl"
 	session_file.write_text(
 		'{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"partial"}],"stopReason":"aborted"}}\n'
 	)
@@ -131,5 +132,46 @@ def test_wait_settled_interrupted_turn_raises(sock_env, tmp_path):
 	try:
 		with pytest.raises(PiSockSessionEnded, match="interrupted"):
 			client.wait_settled(timeout=5, poll=0.05)
+	finally:
+		server.close()
+
+
+def test_wait_settled_provider_error_raises_even_without_text(sock_env, tmp_path):
+	# quota-exhausted-class failure: the run errored before producing any text,
+	# so get_message filters the entry out and the settle condition can never
+	# fire — the outcome check must still raise, immediately
+	session_file = tmp_path / "session-error.jsonl"
+	session_file.write_text(
+		'{"type":"message","message":{"role":"assistant","content":[],"stopReason":"error",'
+		'"errorMessage":"quota exhausted: usage limit reached"}}\n'
+	)
+	server = FakePiSockServer(sock_env, "subagent-err")
+	server.behaviors["state"] = {
+		"isIdle": True, "hasPendingMessages": False, "sessionFile": str(session_file),
+	}
+	server.behaviors["message"] = None  # textless error entry is filtered out
+	client = SockClient(server.sock_path)
+	try:
+		with pytest.raises(PiSockTurnFailed, match="quota exhausted"):
+			client.wait_settled(timeout=5, poll=0.05)
+	finally:
+		server.close()
+
+
+def test_wait_settled_length_stop_still_settles(sock_env, tmp_path):
+	# "length" is a truncated-but-usable response: settles, does not raise
+	session_file = tmp_path / "session-length.jsonl"
+	session_file.write_text(
+		'{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"truncated…"}],"stopReason":"length"}}\n'
+	)
+	server = FakePiSockServer(sock_env, "subagent-len")
+	server.behaviors["state"] = {
+		"isIdle": True, "hasPendingMessages": False, "sessionFile": str(session_file),
+	}
+	server.behaviors["message"] = {"content": "truncated…", "timestamp": 3}
+	client = SockClient(server.sock_path)
+	try:
+		result = client.wait_settled(timeout=5, poll=0.05)
+		assert result is not None and result["isIdle"] is True
 	finally:
 		server.close()
