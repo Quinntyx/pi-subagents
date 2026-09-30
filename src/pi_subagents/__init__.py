@@ -34,7 +34,9 @@ from .catalog import (
 	thinking_levels,
 )
 from .envcheck import ensure_environment
+from .client import PiSockSessionEnded
 from .errors import (
+	AgentPoolFailureError,
 	AgentPoolTimeoutError,
 	PiSubagentsError,
 	PiSubagentsTimeoutError,
@@ -72,7 +74,9 @@ __all__ = [
 	"AgentDictResponse",
 	"SchemaValidationError",
 	"subagent_session_name",
+	"AgentPoolFailureError",
 	"AgentPoolTimeoutError",
+	"PiSockSessionEnded",
 	"PoolClosedError",
 	"SessionReuseError",
 	"PiSubagentsError",

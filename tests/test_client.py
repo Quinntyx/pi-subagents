@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 import pytest
@@ -12,7 +13,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fake_server import FakePiSockServer  # noqa: E402
-from pi_subagents.client import PiSockError, PiSockUnavailable, SockClient  # noqa: E402
+from pi_subagents.client import (
+	PiSockError,
+	PiSockSessionEnded,
+	PiSockUnavailable,
+	SockClient,
+)  # noqa: E402
 
 
 @pytest.fixture()
@@ -86,7 +92,44 @@ def test_wait_settled_timeout_returns_none(sock_env):
 		server.close()
 
 
-def test_wait_settled_dead_socket_returns_none(sock_env):
-	# never-created socket: poll treats missing pi as dead
-	result = SockClient(os.path.join(sock_env, "subagent-gone.sock")).wait_settled(timeout=2, poll=0.05)
-	assert result is None
+def test_wait_settled_dead_socket_raises_session_ended(sock_env):
+	# never-created socket: the session never came up mid-wait → explicit error
+	# (handle.wait awaits the socket before polling, so reaching this state means
+	# the session ended)
+	client = SockClient(os.path.join(sock_env, "subagent-gone.sock"))
+	with pytest.raises(PiSockSessionEnded):
+		client.wait_settled(timeout=2, poll=0.05)
+
+
+def test_wait_settled_socket_lost_midwait_raises(sock_env):
+	server = FakePiSockServer(sock_env, "subagent-dies")
+	server.behaviors["state"] = {"isIdle": False, "hasPendingMessages": False}
+	client = SockClient(server.sock_path)
+	try:
+		# the fake server stops answering mid-wait; the socket file lingers, so
+		# connection-refused is the signal that the session ended
+		threading.Timer(0.3, server.close).start()
+		with pytest.raises(PiSockSessionEnded):
+			client.wait_settled(timeout=5, poll=0.05)
+	finally:
+		server.close()
+
+
+def test_wait_settled_interrupted_turn_raises(sock_env, tmp_path):
+	# last assistant message in the session file has stopReason "aborted": the
+	# user interrupted the agent; that must NOT settle as a clean result
+	session_file = tmp_path / "session.jsonl"
+	session_file.write_text(
+		'{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"partial"}],"stopReason":"aborted"}}\n'
+	)
+	server = FakePiSockServer(sock_env, "subagent-abort")
+	server.behaviors["state"] = {
+		"isIdle": True, "hasPendingMessages": False, "sessionFile": str(session_file),
+	}
+	server.behaviors["message"] = {"content": "partial", "timestamp": 2}
+	client = SockClient(server.sock_path)
+	try:
+		with pytest.raises(PiSockSessionEnded, match="interrupted"):
+			client.wait_settled(timeout=5, poll=0.05)
+	finally:
+		server.close()

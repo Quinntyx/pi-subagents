@@ -23,7 +23,8 @@ from pi_subagents import (  # noqa: E402
 	PoolClosedError,
 	SessionReuseError,
 	Task,
-)
+
+	AgentPoolFailureError,)
 from pi_subagents.handle import AgentHandle as LiveHandle  # noqa: E402
 from pi_subagents.pool import AgentPool, AgentStage  # noqa: E402
 from pi_subagents.registry import REGISTRY  # noqa: E402
@@ -590,3 +591,56 @@ def test_with_statement_keeps_pool_alive_on_exception(tmp_path, instant_factory)
 	summary = pool.close()
 	assert summary.settled >= 1
 	assert pool.last_summary is summary
+
+def test_fail_fast_pool_raises_on_failed_job(tmp_path, monkeypatch):
+	class Boom(FakeLiveFactory):
+		def make(self, prompt, **kwargs):
+			live = super().make(prompt, **kwargs)
+			original_wait = live.wait
+
+			def wait(timeout=None, poll=1.0):
+				raise TimeoutError("pi process died before settling")
+			live.wait = wait  # type: ignore[method-assign]
+			return live
+
+	factory = Boom(tmp_path)
+
+	def spawn(prompt, **kwargs):
+		return factory.make(prompt, name=kwargs.get("name"))
+
+	monkeypatch.setattr(handle_mod, "spawn_pi_window_handle", spawn)
+	with AgentPool(concurrency=1, fail_fast=True) as pool:
+		stage = pool.stage("w", slots=1)
+		stage.submit(Task("p", name="doomed"))
+		with pytest.raises(AgentPoolFailureError) as excinfo:
+			run(pool.pop(timeout=10))
+		result = excinfo.value.result
+		assert result is not None and not result.ok
+		assert result.status == "failed"
+		assert "pi process died before settling" in str(excinfo.value)
+		# one-shot: the next pop drains normally instead of re-raising
+		assert run(pool.pop(timeout=5)) is None
+
+
+def test_default_pool_returns_failed_results(tmp_path, monkeypatch):
+	class Boom(FakeLiveFactory):
+		def make(self, prompt, **kwargs):
+			live = super().make(prompt, **kwargs)
+			original_wait = live.wait
+
+			def wait(timeout=None, poll=1.0):
+				raise TimeoutError("pi died")
+			live.wait = wait  # type: ignore[method-assign]
+			return live
+
+	factory = Boom(tmp_path)
+
+	def spawn(prompt, **kwargs):
+		return factory.make(prompt, name=kwargs.get("name"))
+
+	monkeypatch.setattr(handle_mod, "spawn_pi_window_handle", spawn)
+	with AgentPool(concurrency=1) as pool:
+		stage = pool.stage("w", slots=1)
+		stage.submit(Task("p", name="doomed"))
+		result = run(pool.pop(timeout=10))
+		assert result is not None and not result.ok

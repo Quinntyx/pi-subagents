@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -30,8 +31,45 @@ class PiSockUnavailable(PiSockError, ConnectionError):
 	"""Socket missing, refused, or the pi process is gone."""
 
 
+class PiSockSessionEnded(PiSockError):
+	"""The subagent pi session ended before its turn settled.
+
+	Raised the moment the session's socket disappears or refuses connections
+	mid-wait (the pi process exited or was terminated), or when the session's
+	last assistant message carries ``stopReason: "aborted"`` (the turn was
+	interrupted). Deliberately distinct from a settle timeout: the workflow
+	gets the failure immediately instead of waiting out the timeout, and the
+	resulting failed AgentResult carries this error.
+	"""
+
+
 def socket_path_for(name: str) -> str:
 	return os.path.join(os.environ.get("PI_SOCK_DIR", SOCK_DIR), f"{name}.sock")
+
+
+def _last_stop_reason(session_file: str | None) -> str | None:
+	"""Best-effort stopReason of the session's last assistant message.
+
+	Reads a small tail of the session JSONL (same machine as the subagent).
+	Returns None when the file is unavailable or the field is absent, so older
+	pi-sock versions simply keep the old settle semantics.
+	"""
+	if not session_file or not os.path.exists(session_file):
+		return None
+	try:
+		with open(session_file, "rb") as fh:
+			fh.seek(0, os.SEEK_END)
+			size = fh.tell()
+			fh.seek(max(0, size - 16384))
+			tail = fh.read().decode("utf-8", "replace")
+	except OSError:
+		return None
+	for line in reversed(tail.splitlines()):
+		if '"role":"assistant"' not in line and '"role": "assistant"' not in line:
+			continue
+		match = re.search(r'"stopReason"\s*:\s*"([a-z]+)"', line)
+		return match.group(1) if match else None
+	return None
 
 
 # ---------------------------------------------------------------------------
@@ -123,15 +161,26 @@ class SockClient:
 		- while streaming: idle=False; poll until idle=True
 		- prompt accepted but not started: idle=True, hasPendingMessages=True
 		- finished before we started watching: idle=True, no pending, last message exists
+		Raises:
+		- PiSockSessionEnded: the pi session ended mid-wait (process exited or was
+		  terminated — socket gone or refusing), or the last turn was interrupted
+		  (last assistant message has stopReason "aborted"). Callers surface this
+		  as a failed result instead of a silent drain.
 		"""
 		deadline = (time.monotonic() + timeout) if timeout is not None else None
 		saw_running = False
 		saw_settle = False
 		while True:
+			if self.sock_path and not os.path.exists(self.sock_path):
+				raise PiSockSessionEnded(
+					f"pi session ended before settling (socket {self.sock_path} is gone)"
+				)
 			try:
 				state = self.state()
-			except PiSockUnavailable:
-				return None  # pi is gone; treat as dead rather than hanging
+			except PiSockUnavailable as error:
+				raise PiSockSessionEnded(
+					f"pi session ended before settling ({error})"
+				) from error
 			if not state.get("isIdle"):
 				saw_running = True
 			elif not state.get("hasPendingMessages"):
@@ -139,6 +188,10 @@ class SockClient:
 				if last is not None and (saw_running or last != after_message):
 					saw_settle = True
 			if saw_settle:
+				if _last_stop_reason(state.get("sessionFile")) == "aborted":
+					raise PiSockSessionEnded(
+						"pi session's last turn was interrupted (stopReason=aborted)"
+					)
 				return {"lastAssistant": last, "isIdle": True}
 			if on_tick is not None:
 				on_tick(state)
@@ -249,10 +302,16 @@ class AsyncSockClient:
 		saw_running = False
 		saw_settle = False
 		while True:
+			if self.sock_path and not os.path.exists(self.sock_path):
+				raise PiSockSessionEnded(
+					f"pi session ended before settling (socket {self.sock_path} is gone)"
+				)
 			try:
 				state = await self.state()
-			except PiSockUnavailable:
-				return None
+			except PiSockUnavailable as error:
+				raise PiSockSessionEnded(
+					f"pi session ended before settling ({error})"
+				) from error
 			if not state.get("isIdle"):
 				saw_running = True
 			elif not state.get("hasPendingMessages"):
@@ -260,6 +319,10 @@ class AsyncSockClient:
 				if last is not None and (saw_running or last != after_message):
 					saw_settle = True
 			if saw_settle:
+				if _last_stop_reason(state.get("sessionFile")) == "aborted":
+					raise PiSockSessionEnded(
+						"pi session's last turn was interrupted (stopReason=aborted)"
+					)
 				return {"lastAssistant": last, "isIdle": True}
 			if on_tick is not None:
 				result = on_tick(state)

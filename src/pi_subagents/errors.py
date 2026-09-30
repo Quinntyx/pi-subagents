@@ -36,3 +36,16 @@ class PoolClosedError(PiSubagentsError):
 
 class SessionReuseError(PiSubagentsError):
 	"""A submitted task cannot reuse the requested retained pi session."""
+
+
+class AgentPoolFailureError(PiSubagentsError):
+	"""A job failed while the pool ran with ``fail_fast=True``.
+
+	Raised by :meth:`AgentPool.pop` instead of returning the failed result, so a
+	workflow that does not catch it crashes entirely — leaving the other agents'
+	tmux windows alive for reattachment. ``result`` is the failed AgentResult.
+	"""
+
+	def __init__(self, result: Any):
+		super().__init__(f"subagent {result.task.name} failed: {result.error}")
+		self.result = result
