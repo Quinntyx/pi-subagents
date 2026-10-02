@@ -121,6 +121,8 @@ class AgentHandle:
 			self._awaited = False
 			REGISTRY.emit()
 		self._ensure_valid()
+		if result.error is not None:
+			raise result.error
 		return result
 
 	async def wait_async(self, timeout: float | None = None) -> AgentResult:
@@ -137,6 +139,8 @@ class AgentHandle:
 			self._awaited = False
 			REGISTRY.emit()
 		self._ensure_valid()
+		if result.error is not None:
+			raise result.error
 		return result
 
 	def __await__(self):
@@ -360,8 +364,7 @@ class PoolSummary:
 class AgentPool:
 	"""Autonomous bounded scheduler for multi-stage subagent workflows."""
 
-	def __init__(self, concurrency: int | None = None, *, name: str | None = None,
-			fail_fast: bool = False):
+	def __init__(self, concurrency: int | None = None, *, name: str | None = None):
 		ensure_environment()
 		limit = max_concurrent()
 		self.concurrency = limit if concurrency is None else concurrency
@@ -390,8 +393,6 @@ class AgentPool:
 		self._result_sequence = 0
 		self._running = 0
 		self._closed = False
-		self._fail_fast = fail_fast
-		self._failure: AgentResult | None = None
 		self._pop_waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future] | None = None
 		self._workers = [
 			threading.Thread(target=self._worker, name=f"subagent-pool-{self.id[:6]}-{i}", daemon=True)
@@ -434,9 +435,6 @@ class AgentPool:
 			with self._condition:
 				self._ensure_open()
 				self._reattach_exec_scope_locked()
-				if self._fail_fast and self._failure is not None:
-					failure, self._failure = self._failure, None
-					raise AgentPoolFailureError(failure)
 				if self._results:
 					result = self._results.popleft()
 					waiter = None
@@ -456,6 +454,8 @@ class AgentPool:
 					self._pop_waiter = (loop, waiter)
 			if waiter is None:
 				REGISTRY.emit()
+				if result.error is not None:
+					raise AgentPoolFailureError(result) from result.error
 				return result
 			remaining = None if timeout is None else timeout - (time.monotonic() - started)
 			if remaining is not None and remaining <= 0:
@@ -840,14 +840,8 @@ class AgentPool:
 			duration_ms=handle.runtime_ms,
 			parent=job.parent,
 		)
-		if status == "failed" and self._fail_fast:
-			# Crash-on-failure mode: the failure is delivered as an exception by
-			# the next pop() instead of a returned result, so an inattentive
-			# workflow cannot silently drain while an agent died. The result still
-			# resolves the handle's await and appears in the summary.
-			self._failure = result
-		else:
-			self._results.append(result)
+		# Queue all outcomes so simultaneous failures are each delivered exactly once.
+		self._results.append(result)
 		self._jobs_by_handle.pop(handle.id, None)
 		if handle._live is not None:
 			self._reserved_sessions.pop(id(handle._live), None)

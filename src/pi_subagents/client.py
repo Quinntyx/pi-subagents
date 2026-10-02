@@ -1,7 +1,7 @@
 """Client for the pi-sock unix-socket JSONL RPC (sync + asyncio).
 
 Commands used: send, get_state, get_message, get_activity (pi-sock extension
-with the pi-tool-tree relay), subscribe, abort. Protocol per pi-sock README:
+with the pi-activity relay), subscribe, abort. Protocol per pi-sock README:
 newline-delimited JSON; responses carry {type:"response",command,success,data?,
 error?,id?}; subscribed events arrive as {type:"event",event,data?}.
 """

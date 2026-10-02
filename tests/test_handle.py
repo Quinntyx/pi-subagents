@@ -105,23 +105,25 @@ def test_dict_response_with_schema(tmp_path):
 		resp = h.wait(timeout=5)
 		assert isinstance(resp, AgentDictResponse)
 		assert resp["root_causes"] == ["flaky test"]
-		assert resp.valid is True
+		assert isinstance(resp, dict)
+		assert not hasattr(resp, "valid")
 		assert resp.get_session() is h.session
 	finally:
 		server.close()
 
 
 def test_dict_response_retry_and_failure(tmp_path, monkeypatch):
-	monkeypatch.setenv("PI_SUBAGENTS_SCHEMA_RETRIES", "1")
+	monkeypatch.setenv("PI_SUBAGENTS_SCHEMA_RETRIES", "0")
 	h = AgentHandle("p", name="t6", cwd=str(tmp_path), window_name="t6", model=None, thinking=None,
 					schema={"type": "object", "required": ["x"], "properties": {"x": {"type": "string"}}})
 	server = bind_handle(h, tmp_path)
 	server.behaviors["state"] = {"isIdle": True, "hasPendingMessages": False}
 	server.behaviors["message"] = {"content": "not json at all", "timestamp": 6}
 	try:
-		resp = h.wait(timeout=5)
-		assert resp.valid is False
-		assert resp["raw"] == "not json at all"
+		from pi_subagents.schema import SchemaValidationError
+		with pytest.raises(SchemaValidationError, match="invalid JSON"):
+			h.wait(timeout=5)
+		assert h.status == "failed"
 	finally:
 		server.close()
 

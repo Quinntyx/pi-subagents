@@ -30,18 +30,6 @@ class AgentResult:
 	parent: "AgentResult | None" = None
 
 	@property
-	def ok(self) -> bool:
-		return self.status == "settled" and self.error is None
-
-	def unwrap(self) -> Any:
-		"""Return the response body or raise the task's terminal error."""
-		if self.error is not None:
-			raise self.error
-		if self.body is None:
-			raise RuntimeError(f"task {self.task.name or self.handle.id} produced no response")
-		return self.body
-
-	@property
 	def session(self):
 		"""Parsed persisted session transcript, when a response exists."""
 		return self.body.get_session() if self.body is not None else None

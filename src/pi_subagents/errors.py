@@ -39,7 +39,7 @@ class SessionReuseError(PiSubagentsError):
 
 
 class AgentPoolFailureError(PiSubagentsError):
-	"""A job failed while the pool ran with ``fail_fast=True``.
+	"""A task failed; pool.pop() raises instead of returning the failed outcome.
 
 	Raised by :meth:`AgentPool.pop` instead of returning the failed result, so a
 	workflow that does not catch it crashes entirely — leaving the other agents'

@@ -16,7 +16,7 @@ import time
 from typing import Any
 
 from .client import AsyncSockClient, PiSockError, PiSockUnavailable, SockClient
-from .errors import PiSubagentsError
+from .errors import PiSubagentsError, PiSubagentsTimeoutError
 from .envcheck import require_environment
 from .registry import REGISTRY
 from .response import AgentDictResponse, AgentStrResponse
@@ -87,7 +87,7 @@ class AgentHandle:
 		self.settled_data: dict | None = None
 		self.window_id: str | None = None
 		self.socket_path: str | None = None
-		# latest pi-tool-tree activity (filled by activity polling)
+		# Latest pi-activity API snapshot (filled by activity polling).
 		self.phase: str | None = None
 		self.label: str | None = None
 		self.label_elapsed_ms: int | None = None
@@ -390,7 +390,7 @@ class AgentHandle:
 		return await self._async.state()
 
 	def activity(self) -> dict | None:
-		"""Latest pi-tool-tree snapshot (None when the relay is unavailable)."""
+		"""Latest pi-activity API snapshot (None when the relay is unavailable)."""
 		self._await_ready()
 		snap = self._sync.activity()
 		if snap and snap.get("available"):
@@ -588,7 +588,12 @@ class AgentHandle:
 		self.status = "settled"
 		self._stamp_runtime()
 		REGISTRY.emit()
-		return self._response()
+		try:
+			return self._response()
+		except Exception:
+			self.status = "failed"
+			REGISTRY.emit()
+			raise
 
 	def _response(self) -> Any:
 		text = ""
@@ -610,36 +615,31 @@ class AgentHandle:
 
 
 def _dict_response(handle: AgentHandle, text: str, session) -> "AgentDictResponse":
-	attempt_error: str | None = None
 	retries = _schema_retries()
-	parsed: dict = {}
-	for attempt in range(max(1, retries)):
+	for attempt in range(retries + 1):
 		parsed, error = _parse_json(text)
 		if error is None:
 			try:
 				validate_with_schema(handle.schema, parsed)
 				return AgentDictResponse(parsed, session)
-			except SchemaValidationError as schema_error:
-				attempt_error = f"schema: {schema_error}"
-		else:
-			attempt_error = error
-		if attempt < max(1, retries) - 1:
-			# ask the agent to emit valid JSON matching the schema
-			try:
-				handle.send(_schema_retry_prompt(handle.schema, attempt_error))
-			except PiSockError:
-				break
-			settle = handle._sync.wait_settled(_settle_timeout_default())
-			if settle is None:
-				break
-			handle.settled_data = settle
-			last = settle.get("lastAssistant") or {}
-			text = last.get("content") or ""
-			session.invalidate()
-	return AgentDictResponse(
-		{"valid": False, "error": attempt_error or "no reply", "raw": text},
-		session,
-	)
+			except SchemaValidationError as invalid:
+				error = str(invalid)
+		if attempt == retries:
+			raise SchemaValidationError(
+				f"subagent {handle.name}: response invalid after {attempt + 1} attempts: {error}"
+			)
+		# Require a newer assistant message; an idle socket may still expose the
+		# rejected reply briefly after the repair prompt has been accepted.
+		baseline = (handle.settled_data or {}).get("lastAssistant")
+		handle.send(_schema_retry_prompt(handle.schema, error), mode="follow_up")
+		settle = handle._sync.wait_settled(_settle_timeout_default(), after_message=baseline)
+		if settle is None:
+			raise PiSubagentsTimeoutError(f"subagent {handle.name}: schema repair timed out")
+		handle.settled_data = settle
+		last = settle.get("lastAssistant") or {}
+		text = last.get("content") or ""
+		session.invalidate()
+	raise AssertionError("unreachable response validation state")
 
 
 def _parse_json(text: str) -> tuple[dict | None, str | None]:
@@ -685,8 +685,9 @@ def _schema_retry_prompt(schema: dict, error: str | None) -> str:
 
 
 def _schema_retries() -> int:
+	"""At most three repair follow-ups, in addition to the initial response."""
 	try:
-		return max(1, int(os.environ.get("PI_SUBAGENTS_SCHEMA_RETRIES", "3")))
+		return max(0, min(3, int(os.environ.get("PI_SUBAGENTS_SCHEMA_RETRIES", "3"))))
 	except ValueError:
 		return 3
 

@@ -84,7 +84,3 @@ class AgentDictResponse(dict, _ResponseMixin):
 
 	def __init__(self, value: dict, session: "AgentSession"):  # noqa: D107
 		super().__init__(value)
-
-	@property
-	def valid(self) -> bool:
-		return self.get("valid") is not False

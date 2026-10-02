@@ -31,14 +31,14 @@ build.submit_all(
 )
 
 while (result := await pool.pop()) is not None:
-    if result.stage is build and result.ok:
+    if result.stage is build:
         review.submit(
             subagents.Task(f"Review this implementation:\n\n{result.body}",
                            schema=REVIEW_SCHEMA),
             parent=result,
         )
     elif result.stage is review:
-        verdict = result.unwrap()
+        verdict = result.body
         rounds = result.task.metadata["rounds"]
         if not verdict["passed"] and rounds < 5:
             build.submit(
@@ -96,12 +96,25 @@ through `stage.submit()`.
 
 ### `AgentResult`
 
-Immutable terminal outcome: `task`, `stage`, `handle`, `body`
-(`AgentStrResponse`/`AgentDictResponse`), `error`, `status`
-(`settled`/`failed`/`cancelled`), `duration_ms`, `parent`. `result.ok` and
-`result.unwrap()` (body or raises the stored error) are the two entry points;
-`result.session` exposes the parsed transcript. Failures arrive as results —
-`pop()` only raises for timeouts or a closed pool.
+Successful completion: `task`, `stage`, `handle`, `body`, `status`,
+`duration_ms`, and `parent`. Text-task bodies are native strings; schema-task
+bodies are validated Python dictionaries (`AgentDictResponse`), not JSON text.
+Use `result.body` directly; there is no `result.ok` or `.unwrap()` step.
+`result.session` exposes the parsed transcript.
+
+Failures raise by default, with no `fail_fast` option. Handle waits raise the
+underlying exception; `pool.pop()` raises `AgentPoolFailureError`, whose
+`.result` identifies the failed task and whose cause preserves the original
+exception. Neither closes the pool: inspect it and continue from a later
+notebook cell. Catch expected failures around individual agents/completions;
+avoid a blanket handler around the entire workflow.
+
+Invalid schema output is parsed/validated internally and repaired using the
+actual error in up to three follow-up prompts. Exhaustion raises
+`SchemaValidationError`; a repair timeout raises `PiSubagentsTimeoutError`.
+The library never returns an invalid/raw JSON envelope as a successful schema
+body. Pop timeouts raise `AgentPoolTimeoutError` with a pool snapshot. Explicit
+cancellation is a separate `cancelled` outcome, not a successful response.
 
 ### Session reuse
 
@@ -154,7 +167,7 @@ against a main agent's `π - Vault`. The tmux window keeps the short agent name.
 - `PI_SUBAGENTS_MAX_CONCURRENT` (8) — global ceiling shared by all pools.
 - `PI_SUBAGENTS_SETTLE_TIMEOUT` (30 min) — default per-turn settle wait.
 - `PI_SUBAGENTS_STARTUP_TIMEOUT` (90 s) — pi-sock readiness + first delivery.
-- `PI_SUBAGENTS_SCHEMA_RETRIES` (3) — JSON repair rounds for schema tasks.
+- `PI_SUBAGENTS_SCHEMA_RETRIES` (3) — repair follow-ups after invalid structured output (clamped to 0–3); exhaustion raises `SchemaValidationError`.
 - `PI_SUBAGENTS_CATALOG_TTL` (120 s) — model-catalog cache lifetime.
 - `PI_CODING_SUBAGENT_DIR` — the agent dir spawned subagents run under. Unset, subagents share the orchestrator's own agent dir (`PI_CODING_AGENT_DIR` or `~/.pi/agent`) — zero setup. Point it at any directory with a pi config (including a pi-profiles-managed profile) for a separate subagent environment.
 

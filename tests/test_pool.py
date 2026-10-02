@@ -58,7 +58,8 @@ class FakeLiveFactory:
 		stamps = itertools.count(self.counter)
 		# A fresh timestamp per read, so a retained session's follow-up turn is
 		# never mistaken for the pre-existing message baseline.
-		server.behaviors["message"] = lambda: {"content": self.reply, "timestamp": next(stamps)}
+		reply_text = "{}" if kwargs.get("schema") is not None and self.reply == "hello" else self.reply
+		server.behaviors["message"] = lambda: {"content": reply_text, "timestamp": next(stamps)}
 		live = LiveHandle(prompt, name=kwargs.get("name") or name, cwd=kwargs.get("cwd") or self.tmp_path,
 			window_name=kwargs.get("name") or name, model=kwargs.get("model"), thinking=None, schema=kwargs.get("schema"))
 		ref = type("Ref", (), {"window_id": f"{name}-win", "socket_path": server.sock_path, "name": live.name})()
@@ -130,7 +131,7 @@ def test_submit_pop_and_result_roundtrip(tmp_path, instant_factory):
 		assert handle.status in ("queued", "starting", "running")
 		result = run(pool.pop())
 		assert result is not None
-		assert result.ok
+		assert (result.status == "settled")
 		assert result.sequence == 1
 		assert result.stage is build
 		assert result.handle is handle
@@ -168,7 +169,7 @@ def test_pop_timeout_raises_and_pool_survives(tmp_path):
 			assert pool.snapshot()["running"] == 1, "pool must survive the timeout"
 			gate.set()
 			result = run(pool.pop(timeout=10))
-			assert result is not None and result.ok
+			assert result is not None and (result.status == "settled")
 	finally:
 		gate.set()
 		handle_mod.spawn_pi_window_handle = original
@@ -294,45 +295,38 @@ def test_cancel_queued_task_produces_cancelled_result(tmp_path):
 			result = run(pool.pop(timeout=5))
 			assert result is not None and result.status == "cancelled"
 			assert result.handle is second
-			assert not result.ok
-			with pytest.raises(RuntimeError):
-				result.unwrap()
+			assert not (result.status == "settled")
+			assert result.body is None
 			gate.set()
 			other = run(pool.pop(timeout=5))
-			assert other is not None and other.handle is first and other.ok
+			assert other is not None and other.handle is first and (other.status == "settled")
 			assert run(pool.pop(timeout=5)) is None
 	finally:
 		gate.set()
 		handle_mod.spawn_pi_window_handle = original
 
 
-def test_failed_task_becomes_a_result_not_an_exception(tmp_path, monkeypatch):
-	class Boom(FakeLiveFactory):
-		def make(self, prompt, **kwargs):
-			live = super().make(prompt, **kwargs)
-			original_wait = live.wait
-
-			def wait(timeout=None, poll=1.0):
-				raise TimeoutError("pi died")
-			live.wait = wait  # type: ignore[method-assign]
-			return live
-
-	factory = Boom(tmp_path)
-
+def test_failed_task_raises_from_pop_and_handle(tmp_path, monkeypatch):
+	from pi_subagents.errors import AgentPoolFailureError
 	def spawn(prompt, **kwargs):
-		return factory.make(prompt, name=kwargs.get("name"))
-
+		live = FakeLiveFactory(tmp_path).make(prompt, name=kwargs.get("name"))
+		def fail(timeout=None, poll=1.0):
+			raise TimeoutError("pi died")
+		live.wait = fail
+		return live
 	monkeypatch.setattr(handle_mod, "spawn_pi_window_handle", spawn)
 	with AgentPool(concurrency=1) as pool:
 		stage = pool.stage("w", slots=1)
-		stage.submit(Task("p", name="doomed"))
-		result = run(pool.pop(timeout=10))
-		assert result is not None
-		assert not result.ok
-		assert result.status == "failed"
-		assert isinstance(result.error, TimeoutError)
-		with pytest.raises(TimeoutError):
-			result.unwrap()
+		handle = stage.submit(Task("p", name="doomed"))
+		with pytest.raises(AgentPoolFailureError, match="pi died") as failure:
+			run(pool.pop(timeout=10))
+		assert failure.value.result.status == "failed"
+		assert isinstance(failure.value.__cause__, TimeoutError)
+		with pytest.raises(TimeoutError, match="pi died"):
+			handle.wait(timeout=1)
+		with pytest.raises(TimeoutError, match="pi died"):
+			run(handle.wait_async(timeout=1))
+		assert run(pool.pop(timeout=1)) is None
 
 
 def test_schema_task_returns_dict_response(tmp_path, monkeypatch):
@@ -356,7 +350,7 @@ def test_session_reuse_runs_followup_on_same_window(tmp_path, instant_factory):
 		stage = pool.stage("chat", slots=1)
 		first = stage.submit(Task("first prompt", name="session-owner"))
 		first_result = run(pool.pop(timeout=10))
-		assert first_result is not None and first_result.ok
+		assert first_result is not None and (first_result.status == "settled")
 		source_live = first._live
 		followup = stage.submit(
 			Task("second prompt", name="followup"),
@@ -366,13 +360,13 @@ def test_session_reuse_runs_followup_on_same_window(tmp_path, instant_factory):
 		)
 		assert followup is not first
 		second_result = run(pool.pop(timeout=10))
-		assert second_result is not None and second_result.ok
+		assert second_result is not None and (second_result.status == "settled")
 		assert second_result.handle is followup
 		assert followup._live is source_live, "the same pi session must be reused"
 		assert any(r[1] == "renamed-owner" for r in factory.renamed)
 		assert factory.resumed and factory.resumed[-1][1] == "second prompt"
 		# original handle/result remain settled and untouched
-		assert first.status == "settled" and first_result.ok
+		assert first.status == "settled" and (first_result.status == "settled")
 
 
 def test_session_reuse_validates_config_and_reservation(tmp_path, instant_factory):
@@ -521,7 +515,7 @@ def test_close_returns_pool_summary(tmp_path, instant_factory):
 		stage = pool.stage("w", slots=1)
 		stage.submit(Task("p", name="job-one"))
 		result = run(pool.pop(timeout=10))
-		assert result is not None and result.ok
+		assert result is not None and (result.status == "settled")
 		summary = pool.close()
 		assert summary.name.startswith("pool-")
 		assert summary.submitted == 1
@@ -556,7 +550,7 @@ def test_with_statement_closes_pool_on_clean_exit(tmp_path, instant_factory):
 		stage = pool.stage("w", slots=1)
 		stage.submit(Task("p", name="wither"))
 		result = run(pool.pop(timeout=10))
-		assert result is not None and result.ok
+		assert result is not None and (result.status == "settled")
 	# clean exit: the pool closed itself and recorded the workflow report
 	assert pool.closed
 	assert pool.last_summary is not None
@@ -574,7 +568,7 @@ def test_with_statement_keeps_pool_alive_on_exception(tmp_path, instant_factory)
 			stage = pool.stage("w", slots=1)
 			stage.submit(Task("p", name="survivor"))
 			result = run(pool.pop(timeout=10))
-			assert result is not None and result.ok
+			assert result is not None and (result.status == "settled")
 			raise RuntimeError("boom")
 
 	# the exception must NOT have closed the pool: windows, results, and the
@@ -585,7 +579,7 @@ def test_with_statement_keeps_pool_alive_on_exception(tmp_path, instant_factory)
 	stage = pool.stage("continue", slots=1)
 	stage.submit(Task("p2", name="continued"))
 	continued = run(pool.pop(timeout=10))
-	assert continued is not None and continued.ok
+	assert continued is not None and (continued.status == "settled")
 	assert continued.task.name == "continued"
 	# the orchestrator closes it explicitly once done
 	summary = pool.close()
@@ -609,20 +603,20 @@ def test_fail_fast_pool_raises_on_failed_job(tmp_path, monkeypatch):
 		return factory.make(prompt, name=kwargs.get("name"))
 
 	monkeypatch.setattr(handle_mod, "spawn_pi_window_handle", spawn)
-	with AgentPool(concurrency=1, fail_fast=True) as pool:
+	with AgentPool(concurrency=1) as pool:
 		stage = pool.stage("w", slots=1)
 		stage.submit(Task("p", name="doomed"))
 		with pytest.raises(AgentPoolFailureError) as excinfo:
 			run(pool.pop(timeout=10))
 		result = excinfo.value.result
-		assert result is not None and not result.ok
+		assert result is not None and not (result.status == "settled")
 		assert result.status == "failed"
 		assert "pi process died before settling" in str(excinfo.value)
 		# one-shot: the next pop drains normally instead of re-raising
 		assert run(pool.pop(timeout=5)) is None
 
 
-def test_default_pool_returns_failed_results(tmp_path, monkeypatch):
+def test_default_pool_raises_for_failed_tasks(tmp_path, monkeypatch):
 	class Boom(FakeLiveFactory):
 		def make(self, prompt, **kwargs):
 			live = super().make(prompt, **kwargs)
@@ -642,5 +636,6 @@ def test_default_pool_returns_failed_results(tmp_path, monkeypatch):
 	with AgentPool(concurrency=1) as pool:
 		stage = pool.stage("w", slots=1)
 		stage.submit(Task("p", name="doomed"))
-		result = run(pool.pop(timeout=10))
-		assert result is not None and not result.ok
+		from pi_subagents.errors import AgentPoolFailureError
+		with pytest.raises(AgentPoolFailureError, match="pi died"):
+			run(pool.pop(timeout=10))
