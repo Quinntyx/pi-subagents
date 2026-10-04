@@ -53,17 +53,22 @@ pool.close()  # destroy retained windows and invalidate handles
 
 ## API
 
-### `Task(prompt, *, name=None, model=None, thinking=None, schema=None, cwd=None, profile=None, timeout=None, metadata=None)`
+### `Task(prompt, *, name=None, model=None, thinking=None, schema=None, cwd=None, agentDir=None, timeout=None, metadata=None)`
 
 Immutable description of one scheduled subagent turn. `metadata` is copied and
 exposed read-only; every task carries a non-negative integer `metadata["rounds"]`
-(roots default to 0). `timeout` bounds the turn's settle wait.
+(roots default to 0). `timeout` bounds the initial settle wait, not schema-repair
+waits or total validated completion time. Each schema-repair wait independently
+uses `PI_SUBAGENTS_SETTLE_TIMEOUT` (default 30 minutes).
 
 ### `AgentPool(concurrency=None, *, name=None)`
 
-Hard cap on concurrently running subagents (default and ceiling:
-`PI_SUBAGENTS_MAX_CONCURRENT`, 8). The pool runs its own worker threads, so work
-keeps flowing even when the orchestrating PTC chunk ends between turns.
+Hard cap on active scheduled turns (default and ceiling:
+`PI_SUBAGENTS_MAX_CONCURRENT`, currently 8). Queued tasks and the retained handle
+roster are not active concurrency. The ceiling is shared by pools in this Python
+process; it is not a cross-kernel coordinator. The pool runs its own worker
+threads, so work keeps flowing even when the orchestrating PTC chunk ends
+between turns.
 - `pool.stage(name, *, slots)` — create a queue (names are unique; the sum of
   slots may not exceed the pool's concurrency).
 - `await pool.pop(timeout=None)` — next completion in pool-observed completion
@@ -72,10 +77,11 @@ keeps flowing even when the orchestrating PTC chunk ends between turns.
   `pool` and `snapshot`) without touching the work.
 - `pool.handles(status=None)` — snapshot of submitted handles.
 - `pool.snapshot()` — counters plus per-stage rows.
-- `pool.close()` — the only teardown: rejects submissions, cancels queued work,
-  aborts running turns, kills every tmux window (settled sessions included),
-  invalidates all handles, and wakes blocked `pop()` calls with
-  `PoolClosedError`. Idempotent.
+- `pool.close()` — explicit teardown: rejects submissions, cancels queued work,
+  aborts running turns, destroys every remaining tmux window (including retained
+  failures), invalidates live and dormant handles, and wakes blocked `pop()`
+  calls with `PoolClosedError`. Idempotent. Success-only hibernation below is
+  resource release, not pool teardown.
 
 ### `AgentStage`
 
@@ -83,16 +89,47 @@ keeps flowing even when the orchestrating PTC chunk ends between turns.
 enqueue and return an `AgentHandle` immediately; spawning happens when a worker
 slot frees. `submit_all(tasks)` fans out. Each stage has `slots` **soft**
 priority reservations: idle slots are borrowed by other stages (non-preemptive —
-borrowed runs finish before slots revert). With no stages defined the pool
-still schedules fairly across submissions to any stage.
+borrowed runs finish before slots revert). Every submission requires a stage
+created with `pool.stage()`, even when its reservation is `slots=0`. If all
+stages have zero reservations, queued submissions are scheduled in submission
+order across those stages.
 
 ### `AgentHandle`
 
-One submission; valid while queued (steer/inspect only after dispatch).
+One submission; valid while queued (steer/live inspection only after dispatch).
 `await handle` (or `handle.wait(timeout)`) resolves to that task's `AgentResult`.
 `handle.cancel()` cancels queued work or aborts the running turn.
-`send(text, mode="steer")` steers the currently running turn; new turns go
-through `stage.submit()`.
+`handle.send(text, mode="steer")` and `await handle.send_async(text, mode="steer")`
+have two paths:
+- On an active (`starting`/`running`) submission, they deliver to the existing
+  agent and return the pi-sock acknowledgement, not an `AgentResult`.
+  `mode="steer"` steers that turn; `mode="follow_up"` queues a socket follow-up
+  on the active agent, not a separately scheduled task or completion.
+- On a settled, failed or cancelled handle with a retained session, they submit
+  a new scheduled prompt on that session. The acknowledgement is
+  `{"scheduled": True, "handle": new_handle, "handleId": new_handle.id,
+  "status": "queued"}`; it is not the answer, and the worker may already have
+  advanced the new handle by the time the caller inspects it. Await
+  `ack["handle"]` for the new result, or consume it through `pool.pop()`.
+
+A scheduled send uses the same stage and inherits the task's name, schema,
+timeout and metadata (including `rounds`, without incrementing it); its parent
+is the original result. Model/thinking/cwd/agentDir inherit from the session.
+Use `stage.submit(Task(...), parent=..., session_handle=...)` to change the
+prompt contract or explicitly advance a workflow round. The original handle
+still resolves to its original result; the new turn has its own handle, result
+and completion. Scheduled prompts cannot bypass capacity, and only dormant
+sessions are transparently reopened. One queued or running continuation may
+own a session at a time; duplicate continuations raise `SessionReuseError`.
+A never-dispatched queued task has no session to send to.
+
+`handle.state()`, `handle.activity()` (and their async counterparts),
+`handle.agent_state()` and `result.session` support inspection. Dormant sessions
+use cached inspection and their durable transcript, without reopening pi just
+for a read. These snapshots are not live telemetry. `handle.agent_state()`
+includes `sessionFile`, `sessionId`, `dormant` and `lastOutcome`; session identity
+survives hibernation even though a later window/socket may differ. Queued tasks
+have no live session yet.
 
 ### `AgentResult`
 
@@ -105,8 +142,9 @@ Use `result.body` directly; there is no `result.ok` or `.unwrap()` step.
 Failures raise by default, with no `fail_fast` option. Handle waits raise the
 underlying exception; `pool.pop()` raises `AgentPoolFailureError`, whose
 `.result` identifies the failed task and whose cause preserves the original
-exception. Neither closes the pool: inspect it and continue from a later
-notebook cell. Catch expected failures around individual agents/completions;
+exception. Neither closes the pool or automatically unloads the failed session:
+inspect its retained tmux window and continue from a later notebook cell. Catch
+expected failures around individual agents/completions;
 avoid a blanket handler around the entire workflow.
 
 Invalid schema output is parsed/validated internally and repaired using the
@@ -118,16 +156,38 @@ The library never returns an invalid/raw JSON envelope as a successful schema
 body. Pop timeouts raise `AgentPoolTimeoutError` with a pool snapshot. Explicit
 cancellation is a separate `cancelled` outcome, not a successful response.
 
-### Session reuse
+### Session lifecycle and reuse
 
-`session_handle=result.handle` re-runs a settled pi session as a follow-up turn
-in the same tmux window instead of spawning a new one. The reused turn gets a
-new handle and result; the old ones stay settled and immutable. Omitted
-model/thinking/cwd/profile inherit the session's configuration; explicit
+After a task successfully settles, the runtime attempts to hibernate its pi
+process by destroying its tmux window **only if its last outcome is `ok`**.
+Schema-task success requires validation first. Unloading also requires an idle
+session with no pending messages and a durable session file confirming the
+successful terminal outcome. If these safety checks or cleanup fail, the
+successful session stays loaded; its result remains successful. Hibernation
+retains the session identity/path, transcript and cached inspection on its
+handles until explicit pool close; it does not invalidate handles or change
+completion accounting.
+
+Failed, crashed, cancelled, timed-out, schema-exhausted or interrupted sessions
+are not automatically unloaded. Existing pi/tmux sessions remain available for
+manual inspection and continuation; a process that already crashed cannot be
+kept running. A failed turn that follows an earlier success must not hibernate
+based on that older outcome. Interrupting an orchestrating cell does not itself
+close the pool or unload its agents.
+
+`stage.submit(task, session_handle=result.handle)` schedules a follow-up on a
+settled session; failed or cancelled handles with retained sessions can also
+be continued. A never-dispatched task cannot be reused.
+A live retained session is reused in place. A dormant successful session is
+reopened with `pi --session` using its saved session path **only after pool
+capacity is acquired**; its old tmux window need not still exist. Reopening is
+transparent, not a new conversation or an extra retry. The reused turn gets a
+new handle and result; the old task outcomes stay immutable. Omitted
+model/thinking/cwd/agentDir inherit the session's configuration; explicit
 conflicts raise `SessionReuseError`. A session processes one turn at a time
-(double-booking raises). `session_name="new-name"` renames the live pi session
-(pi updates its terminal title immediately). Settlement is correlated against
-the pre-follow-up message, so a reused session can never return a stale reply.
+(double-booking raises, including queued continuations). `session_name="new-name"`
+renames the pi session for the follow-up. Settlement is correlated against the
+pre-follow-up message, so a reused session can never return a stale reply.
 
 ### Cyclic workflows
 
@@ -135,6 +195,25 @@ Reuse `parent=result` to propagate workflow identity. Only override what
 changes (typically `rounds`); everything else is inherited. Gate every cycle on
 a round limit — `pop()` returns `None` only when nothing is queued or running,
 so an ungated build→review→fix cycle runs forever.
+
+Keep scheduling completion-driven and work-conserving: consume `pool.pop()` and
+submit ready follow-ups as slots free rather than waiting for a whole batch.
+When useful, keep roughly `3 * C` small, bounded tasks ready, where `C` is the
+active cap; this headroom is a queued roster, not permission to run `3 * C`
+agents. Give each prompt explicit inputs, owned files, output expectations and
+checks. Shared-workspace writers must own disjoint files. File ownership alone
+does not isolate commands: builds/tests may share generated outputs, caches,
+locks, service ports or other process-wide resources. Give commands isolated
+resources where supported; otherwise serialize conflicting commands.
+
+When overlapping writes require worktrees, use them only with explicit
+permission. Create them lazily for ready tasks, bound live worktree use to the
+needed active writers rather than precreating one per queued task, and arrange
+authorized cleanup. If worktrees or isolation are forbidden/unavailable, keep
+disjoint ownership and serialize overlaps/shared-resource commands, or report
+a blocker instead of modifying git state or another writer's files. Gate
+integration on dependencies and retain the workflow's review, round limits and
+explicit cleanup.
 
 ## Choosing a model or effort level
 
@@ -163,10 +242,14 @@ not through the tmux command.
 Every subagent window is launched with `pi --name "(subagent) <name>"`, so the
 terminal title tmux's overview shows reads `π - (subagent) build-auth - Vault`
 against a main agent's `π - Vault`. The tmux window keeps the short agent name.
+Spawn and dormant reopening target the parent tmux session's stable ID rather
+than its cached name, so renaming that tmux session does not invalidate placement.
+This tmux ID is separate from the durable pi conversation identity.
 
 ## Environment knobs
 
-- `PI_SUBAGENTS_MAX_CONCURRENT` (8) — global ceiling shared by all pools.
+- `PI_SUBAGENTS_MAX_CONCURRENT` (8) — active-turn ceiling shared by all pools in
+  this Python process; queued/retained roster size is not active concurrency.
 - `PI_SUBAGENTS_SETTLE_TIMEOUT` (30 min) — default per-turn settle wait.
 - `PI_SUBAGENTS_STARTUP_TIMEOUT` (90 s) — pi-sock readiness + first delivery.
 - `PI_SUBAGENTS_SCHEMA_RETRIES` (3) — repair follow-ups after invalid structured output (clamped to 0–3); exhaustion raises `SchemaValidationError`.

@@ -1,8 +1,9 @@
 """Shared pytest fixtures for the pi-subagents test suite.
 
-Two autouse guards make window/pool leaks structurally impossible rather than
+Autouse guards prevent real tmux mutations and window/pool leaks rather than
 a matter of test discipline:
 
+- ``_no_live_tmux_mutations`` rejects unmocked process-boundary mutations.
 - ``_clean_registry`` closes any pool still open at teardown.
 - ``_kill_spawned_windows`` records every *real* tmux window spawned during a
   test and kills any survivor on teardown — even if the test crashed mid-way
@@ -24,7 +25,29 @@ from pi_subagents.registry import REGISTRY
 
 
 @pytest.fixture(autouse=True)
-def _clean_registry():
+def _no_live_tmux_mutations(monkeypatch):
+	"""A missing mock must fail a unit test, never mutate the user's tmux server."""
+	original_tmux = tmuxenv.tmux
+	original_run = tmuxenv.subprocess.run
+	attempted = []
+	read_commands = {
+		"display-message", "list-windows", "list-panes", "has-session",
+		"show-options", "show-environment",
+	}
+
+	def guarded_tmux(*args):
+		if args and args[0] not in read_commands and tmuxenv.subprocess.run is original_run:
+			attempted.append(args)
+			raise AssertionError(f"Unmocked tmux mutation forbidden in unit tests: {args!r}")
+		return original_tmux(*args)
+
+	monkeypatch.setattr(tmuxenv, "tmux", guarded_tmux)
+	yield
+	assert not attempted, f"Process-boundary mock escaped: {attempted!r}"
+
+
+@pytest.fixture(autouse=True)
+def _clean_registry(_no_live_tmux_mutations):
 	REGISTRY._handles.clear()
 	REGISTRY._pools.clear()
 	yield
@@ -39,7 +62,7 @@ def _clean_registry():
 
 
 @pytest.fixture(autouse=True)
-def _kill_spawned_windows():
+def _kill_spawned_windows(_no_live_tmux_mutations):
 	"""Kill any tmux window a test actually spawned, leaked or not."""
 	spawned: list[str] = []
 	original = handle_mod.spawn_pi_window

@@ -31,8 +31,10 @@ class AgentResult:
 
 	@property
 	def session(self):
-		"""Parsed persisted session transcript, when a response exists."""
-		return self.body.get_session() if self.body is not None else None
+		"""Frozen transcript inspection, including failed/interrupted turns."""
+		if self.body is not None:
+			return self.body.get_session()
+		return self.handle._inspection_session
 
 	def __str__(self) -> str:
 		"""Readable form for kernel auto-echo (Out[n]); repr stays constructor-shaped.

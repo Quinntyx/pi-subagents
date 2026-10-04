@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import socket
 import threading
 import time
@@ -57,38 +56,50 @@ def socket_path_for(name: str) -> str:
 	return os.path.join(os.environ.get("PI_SOCK_DIR", SOCK_DIR), f"{name}.sock")
 
 
-def _last_assistant_outcome(session_file: str | None) -> tuple[str, str | None] | None:
-	"""Best-effort (stopReason, errorMessage) of the session's last assistant entry.
+def _assistant_outcome_marker(session_file: str | None) -> str | None:
+	"""Latest assistant entry identity, including content-free/large replies.
 
-	Reads a small tail of the session JSONL (same machine as the subagent).
-	Returns None when the file is unavailable or no stopReason is present, so
-	older pi versions simply keep the old settle semantics.
+	Read backwards in chunks, retaining complete JSONL entries. Fixed-size tail
+	reads can miss the role/stopReason of a large successful or failed message.
 	"""
-	if not session_file or not os.path.exists(session_file):
+	if not session_file:
 		return None
 	try:
 		with open(session_file, "rb") as fh:
 			fh.seek(0, os.SEEK_END)
-			size = fh.tell()
-			fh.seek(max(0, size - 16384))
-			tail = fh.read().decode("utf-8", "replace")
+			position = fh.tell()
+			prefix = b""
+			while position > 0:
+				size = min(position, 16384)
+				position -= size
+				fh.seek(position)
+				lines = (fh.read(size) + prefix).split(b"\n")
+				prefix = lines.pop(0) if position > 0 else b""
+				for raw in reversed(lines):
+					try:
+						entry = json.loads(raw)
+					except (ValueError, UnicodeDecodeError):
+						continue
+					if isinstance(entry, dict) and entry.get("type") == "message":
+						message = entry.get("message")
+						if isinstance(message, dict) and message.get("role") == "assistant":
+							return raw.decode("utf-8", "replace")
 	except OSError:
 		return None
-	for line in reversed(tail.splitlines()):
-		if '"role":"assistant"' not in line and '"role": "assistant"' not in line:
-			continue
-		stop_match = re.search(r'"stopReason"\s*:\s*"([a-z]+)"', line)
-		if not stop_match:
-			return None
-		error_match = re.search(r'"errorMessage"\s*:\s*"((?:[^"\\]|\\.)*)"', line)
-		error_message = None
-		if error_match:
-			try:
-				error_message = json.loads('"' + error_match.group(1) + '"')
-			except Exception:
-				error_message = error_match.group(1)
-		return stop_match.group(1), error_message
 	return None
+
+
+def _last_assistant_outcome(session_file: str | None) -> tuple[str, str | None] | None:
+	"""Best-effort terminal outcome of the latest persisted assistant entry."""
+	marker = _assistant_outcome_marker(session_file)
+	if marker is None:
+		return None
+	message = json.loads(marker).get("message") or {}
+	stop = message.get("stopReason")
+	if not isinstance(stop, str):
+		return None
+	error = message.get("errorMessage")
+	return stop, error if isinstance(error, str) else None
 
 
 def raise_for_failed_outcome(session_file: str | None, *, last_message: dict | None = None) -> None:
@@ -122,6 +133,77 @@ def raise_for_failed_outcome(session_file: str | None, *, last_message: dict | N
 		)
 
 
+def _delivered_assistant_marker(session_file: str | None, deliveries: tuple) -> str | None:
+	"""Latest assistant after all accepted direct sends' existing log entries.
+
+	pi-sock sends custom session-message entries. Pre-RPC offsets distinguish
+	repeated text. The old turn may finish between get_state and send, but its
+	assistant precedes the delivery boundary and cannot satisfy the new turn.
+	"""
+	if not session_file or not deliveries or any(offset is None for offset, _ in deliveries):
+		return None
+	try:
+		with open(session_file, "rb") as fh:
+			fh.seek(deliveries[0][0])
+			matched = 0
+			marker = None
+			while True:
+				position = fh.tell()
+				raw = fh.readline()
+				if not raw or not raw.endswith(b"\n"):
+					break  # ignore an entry the writer has not finished
+				try:
+					entry = json.loads(raw)
+				except (ValueError, UnicodeDecodeError):
+					continue
+				if not isinstance(entry, dict):
+					continue
+				if matched < len(deliveries):
+					offset, text = deliveries[matched]
+					if (position >= offset and entry.get("type") == "custom_message"
+						and entry.get("customType") == "session-message" and entry.get("content") == text):
+						matched += 1
+					continue
+				message = entry.get("message")
+				if entry.get("type") == "message" and isinstance(message, dict) and message.get("role") == "assistant":
+					marker = raw.decode("utf-8", "replace")
+			return marker if matched == len(deliveries) else None
+	except OSError:
+		return None
+
+
+def _settled_assistant(marker: str | None, wire: dict | None, *, after_outcome: str | None,
+                       after_message: dict | None, deliveries: tuple | None = None) -> dict | None:
+	"""Correlate a reply with the actual durable terminal, including empty text."""
+	if deliveries is not None and marker is None:
+		return None
+	if after_outcome is not None and (marker is None or marker == after_outcome):
+		return None
+	if marker is not None:
+		message = json.loads(marker)["message"]
+		raise_for_failed_outcome(None, last_message=message)
+		stop = message.get("stopReason")
+		if stop in ("toolUse", "pending", "deferred"):
+			return None
+		content = message.get("content", [])
+		text = content if isinstance(content, str) else "\n".join(
+			part.get("text", "") for part in content
+			if isinstance(part, dict) and part.get("type") == "text"
+		)
+		last = {"content": text, "timestamp": message.get("timestamp")}
+		if "timestamp" not in message and wire is not None and wire.get("content") == text:
+			last["timestamp"] = wire.get("timestamp")
+		if isinstance(stop, str):
+			last["stopReason"] = stop
+		if after_outcome is not None or deliveries is not None or last != after_message:
+			return last
+		return None
+	if wire is not None and wire != after_message:
+		raise_for_failed_outcome(None, last_message=wire)
+		return wire
+	return None
+
+
 # ---------------------------------------------------------------------------
 # sync client
 # ---------------------------------------------------------------------------
@@ -132,6 +214,8 @@ class SockClient:
 	def __init__(self, sock_path: str, timeout: float = CONNECT_TIMEOUT):
 		self.sock_path = sock_path
 		self.timeout = timeout
+		self._after_outcome: str | None = None
+		self._after_deliveries: tuple | None = None
 
 	def _connect(self) -> socket.socket:
 		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -218,9 +302,6 @@ class SockClient:
 		  as a failed result instead of a silent drain.
 		"""
 		deadline = (time.monotonic() + timeout) if timeout is not None else None
-		saw_running = False
-		saw_settle = False
-		outcome_checked = False
 		while True:
 			if self.sock_path and not os.path.exists(self.sock_path):
 				raise PiSockSessionEnded(
@@ -232,23 +313,16 @@ class SockClient:
 				raise PiSockSessionEnded(
 					f"pi session ended before settling ({error})"
 				) from error
-			if not state.get("isIdle"):
-				saw_running = True
-				outcome_checked = False
-			elif not state.get("hasPendingMessages"):
-				# Idle with nothing queued: the run has ended — completed, errored,
-				# or interrupted. Check the terminal outcome ONCE per run before the
-				# settle test: a provider failure that produced no text content is
-				# filtered out of get_message, so the settle condition below may
-				# never fire and the wait would silently run out its timeout.
-				if not outcome_checked:
-					outcome_checked = True
-					raise_for_failed_outcome(state.get("sessionFile"))
-				last = self.message()
-				if last is not None and (saw_running or last != after_message):
-					saw_settle = True
-			if saw_settle:
-				return {"lastAssistant": last, "isIdle": True}
+			if state.get("isIdle") and not state.get("hasPendingMessages"):
+				marker = (_delivered_assistant_marker(state.get("sessionFile"), self._after_deliveries)
+				          if self._after_deliveries is not None else
+				          _assistant_outcome_marker(state.get("sessionFile")))
+				last = _settled_assistant(marker, self.message(), after_outcome=self._after_outcome,
+				                          after_message=after_message, deliveries=self._after_deliveries)
+				if last is not None:
+					self._after_outcome = None
+					self._after_deliveries = None
+					return {**state, "lastAssistant": last, "isIdle": True}
 			if on_tick is not None:
 				on_tick(state)
 			if deadline is not None and time.monotonic() >= deadline:
@@ -284,6 +358,8 @@ class AsyncSockClient:
 	def __init__(self, sock_path: str, timeout: float = CONNECT_TIMEOUT):
 		self.sock_path = sock_path
 		self.timeout = timeout
+		self._after_outcome: str | None = None
+		self._after_deliveries: tuple | None = None
 
 	async def _connect(self):
 		try:
@@ -355,9 +431,6 @@ class AsyncSockClient:
 		after_message: dict | None = None,
 	) -> dict | None:
 		deadline = (time.monotonic() + timeout) if timeout is not None else None
-		saw_running = False
-		saw_settle = False
-		outcome_checked = False
 		while True:
 			if self.sock_path and not os.path.exists(self.sock_path):
 				raise PiSockSessionEnded(
@@ -369,23 +442,17 @@ class AsyncSockClient:
 				raise PiSockSessionEnded(
 					f"pi session ended before settling ({error})"
 				) from error
-			if not state.get("isIdle"):
-				saw_running = True
-				outcome_checked = False
-			elif not state.get("hasPendingMessages"):
-				# Idle with nothing queued: the run has ended — completed, errored,
-				# or interrupted. Check the terminal outcome ONCE per run before the
-				# settle test: a provider failure that produced no text content is
-				# filtered out of get_message, so the settle condition below may
-				# never fire and the wait would silently run out its timeout.
-				if not outcome_checked:
-					outcome_checked = True
-					raise_for_failed_outcome(state.get("sessionFile"))
-				last = await self.message()
-				if last is not None and (saw_running or last != after_message):
-					saw_settle = True
-			if saw_settle:
-				return {"lastAssistant": last, "isIdle": True}
+			if state.get("isIdle") and not state.get("hasPendingMessages"):
+				if self._after_deliveries is not None:
+					marker = await asyncio.to_thread(_delivered_assistant_marker, state.get("sessionFile"), self._after_deliveries)
+				else:
+					marker = await asyncio.to_thread(_assistant_outcome_marker, state.get("sessionFile"))
+				last = _settled_assistant(marker, await self.message(), after_outcome=self._after_outcome,
+				                          after_message=after_message, deliveries=self._after_deliveries)
+				if last is not None:
+					self._after_outcome = None
+					self._after_deliveries = None
+					return {**state, "lastAssistant": last, "isIdle": True}
 			if on_tick is not None:
 				result = on_tick(state)
 				if asyncio.iscoroutine(result):

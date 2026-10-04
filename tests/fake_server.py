@@ -1,7 +1,8 @@
 """Shared helpers: fake pi-sock server for client/handle tests.
 
 wait_settled() is poll-based, so tests drive settle behavior purely through the
-behavior map — no server-push events needed.
+behavior map — no server-push events needed. Opt-in completed turns and send
+hooks model retained-session continuation without changing custom runtimes.
 """
 
 from __future__ import annotations
@@ -10,7 +11,6 @@ import json
 import os
 import socket
 import threading
-import itertools
 
 
 class FakePiSockServer:
@@ -21,6 +21,9 @@ class FakePiSockServer:
 		self.name = name
 		self.behaviors: dict[str, object] = {}
 		self.sent: list[dict] = []
+		self.session_path = os.path.join(sock_dir, f"{name}.jsonl")
+		self._turn = 0
+		self._turn_lock = threading.Lock()
 		self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 		self._server.bind(self.sock_path)
 		os.chmod(self.sock_path, 0o600)
@@ -28,6 +31,30 @@ class FakePiSockServer:
 		self._running = True
 		self._thread = threading.Thread(target=self._serve, daemon=True)
 		self._thread.start()
+
+	def complete_turn(self, content: str, *, timestamp: int | None = None,
+	                  stop_reason: str = "stop") -> dict:
+		"""Publish one completed turn, with matching wire and durable identities.
+
+		Opt-in: lifecycle/race fixtures own their protocol and session files.
+		Reads never manufacture a new turn; a send hook must explicitly finish it.
+		"""
+		with self._turn_lock:
+			self._turn += 1
+			stamp = timestamp if timestamp is not None else self._turn
+			message = {"content": content, "timestamp": stamp, "stopReason": stop_reason}
+			with open(self.session_path, "a", encoding="utf-8") as stream:
+				if self._turn == 1:
+					stream.write(json.dumps({"type": "session", "id": self.name, "version": 3}) + "\n")
+				stream.write(json.dumps({"type": "message", "id": f"reply-{self._turn}",
+					"message": {**message, "role": "assistant",
+						"content": [{"type": "text", "text": content}]}}) + "\n")
+			self.behaviors["message"] = message
+			self.behaviors["state"] = {
+				"isIdle": True, "hasPendingMessages": False,
+				"sessionFile": self.session_path, "sessionId": self.name,
+			}
+			return dict(message)
 
 	def close(self) -> None:
 		self._running = False
@@ -80,7 +107,9 @@ class FakePiSockServer:
 			return {"type": "response", "command": ctype, "success": True, "data": _behavior("activity", {"available": False})}
 		if ctype == "send":
 			self.sent.append(command)
-			return {"type": "response", "command": ctype, "success": True, "data": {"delivered": True, "mode": "direct"}}
+			hook = self.behaviors.get("send")
+			data = hook(command) if callable(hook) else {"delivered": True, "mode": "direct"}
+			return {"type": "response", "command": ctype, "success": True, "data": data}
 		if ctype in ("abort", "subscribe"):
 			return {"type": "response", "command": ctype, "success": True, "data": {}}
 		if ctype == "set_session_name":

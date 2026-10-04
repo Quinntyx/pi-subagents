@@ -18,12 +18,15 @@ from pi_subagents.response import AgentStrResponse  # noqa: E402
 
 def bind_handle(h: AgentHandle, tmp_path) -> FakePiSockServer:
 	ref = type("Ref", (), {
-		"window_id": "win1",
+		"window_id": "@fake-async-" + h.id,
 		"socket_path": os.path.join(str(tmp_path), f"{h.id}.sock"),
 		"name": h.name,
 	})()
 	server = FakePiSockServer(str(tmp_path), h.id)
 	h._bind(ref)
+	# The fake process has already accepted its initial prompt.
+	h._startup_started = True
+	h._ready.set_result(None)
 	return server
 
 
@@ -86,17 +89,23 @@ def test_resume_async_reopens(tmp_path):
 	async def run():
 		h = AgentHandle("p", name="a4", cwd=str(tmp_path), window_name="a4", model=None, thinking=None, schema=None)
 		server = bind_handle(h, tmp_path)
-		server.behaviors["state"] = {"isIdle": True, "hasPendingMessages": False}
-		server.behaviors["message"] = {"content": "old answer", "timestamp": 3}
+		server.complete_turn("old answer", timestamp=3)
+		def followup(command):
+			assert command["mode"] == "follow_up"
+			server.complete_turn("continued", timestamp=4)
+			return {"delivered": True, "mode": "direct"}
+		server.behaviors["send"] = followup
 		try:
-			await h
+			await h.wait_async(timeout=5)
+			from pi_subagents.client import _assistant_outcome_marker
+			baseline = _assistant_outcome_marker(server.session_path)
 			h2 = await h.resume_async("continue please")
 			assert h2 is h and h.closed is False and h.status == "running"
-			# a fresh message (new timestamp) is required: resume must never
-			# mistake the pre-existing reply for the follow-up's settlement
-			server.behaviors["message"] = {"content": "continued", "timestamp": 4}
+			# Both the wire reply and persisted outcome belong to the new turn.
+			assert _assistant_outcome_marker(server.session_path) != baseline
 			resp = await h.wait_async(timeout=5)
 			assert resp == "continued"
+			assert server.sent[-1]["text"] == "continue please"
 		finally:
 			server.close()
 

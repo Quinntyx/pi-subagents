@@ -29,14 +29,18 @@ def _clean_registry():
 	REGISTRY._handles.clear()
 
 
-def bind_handle(h: AgentHandle, tmp_path) -> FakePiSockServer:
+def bind_handle(h: AgentHandle, tmp_path, *, ready: bool = True) -> FakePiSockServer:
 	ref = type("Ref", (), {
-		"window_id": h.name + "-win",
+		"window_id": "@fake-handle-" + h.id,
 		"socket_path": os.path.join(str(tmp_path), f"{h.id}.sock"),
 		"name": h.name,
 	})()
 	server = FakePiSockServer(str(tmp_path), h.id)
 	h._bind(ref)
+	# Binding alone is not startup completion: model an accepted first prompt.
+	if ready:
+		h._startup_started = True
+		h._ready.set_result(None)
 	return server
 
 
@@ -71,15 +75,26 @@ def test_await_after_abort_raises(tmp_path):
 def test_resume_reopens_handle(tmp_path):
 	h = AgentHandle("p", name="t3", cwd=str(tmp_path), window_name="t3", model=None, thinking=None, schema=None)
 	server = bind_handle(h, tmp_path)
-	server.behaviors["state"] = {"isIdle": False, "hasPendingMessages": False}
+	server.complete_turn("partial", stop_reason="aborted")
+	def followup(command):
+		assert command["mode"] == "follow_up"
+		server.complete_turn("continued")
+		return {"delivered": True, "mode": "direct"}
+	server.behaviors["send"] = followup
 	try:
+		h.state()  # remember the persisted interrupted turn before resuming
 		h.abort()
 		assert h.status == "stopped"
+		from pi_subagents.client import _assistant_outcome_marker
+		baseline = _assistant_outcome_marker(server.session_path)
 		h.resume("keep going")
 		assert h.closed is False
 		assert h.status == "running"
 		with pytest.raises(ValueError):
 			h.resume("again")
+		assert _assistant_outcome_marker(server.session_path) != baseline
+		assert h.wait(timeout=5) == "continued"
+		assert server.sent[-1]["text"] == "keep going"
 	finally:
 		server.close()
 
@@ -221,7 +236,7 @@ def test_pool_close_kills_windows_and_prunes_sockets(tmp_path, monkeypatch):
 		server = FakePiSockServer(str(tmp_path), live.id)
 		server.behaviors["state"] = {"isIdle": True, "hasPendingMessages": False}
 		server.behaviors["message"] = {"content": "x", "timestamp": 1}
-		live._bind(type("Ref", (), {"window_id": live.name + "-win", "socket_path": server.sock_path, "name": live.name})())
+		live._bind(type("Ref", (), {"window_id": "@fake-handle-" + live.id, "socket_path": server.sock_path, "name": live.name})())
 		servers.append(server)
 		return live
 
@@ -318,7 +333,7 @@ def test_startup_delivers_the_initial_prompt_over_pisock(tmp_path, monkeypatch):
 
 	prompt = "it's a test: don't \"fail\" on 'quotes' " * 50
 	h = AH(prompt, name="boot", cwd=str(tmp_path), window_name="boot", model=None, thinking=None, schema=None)
-	server = bind_handle(h, tmp_path)
+	server = bind_handle(h, tmp_path, ready=False)
 	h._startup_started = True
 	try:
 		h._run_startup()

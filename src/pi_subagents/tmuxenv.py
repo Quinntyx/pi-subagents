@@ -7,6 +7,8 @@ import re
 import secrets
 import shlex
 import shutil
+# Keep the established process-boundary alias used by external wrappers.
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -102,6 +104,7 @@ def spawn_pi_window(
 	depth: int,
 	agentDir: str | os.PathLike[str] | None = None,
 	session_name: str | None = None,
+	session_file: str | None = None,
 ) -> "WindowRef":
 	"""Create a tmux window running an interactive pi instance with a prompt.
 
@@ -118,7 +121,10 @@ def spawn_pi_window(
 		prompt,
 		model=model,
 		thinking=thinking,
-		session_name=subagent_session_name(session_name or name),
+		# Reopening inherits the persisted display name unless explicitly renamed.
+		session_name=(subagent_session_name(session_name or name)
+		              if session_file is None or session_name is not None else None),
+		session_file=session_file,
 	)
 	args = [
 		"new-window",
@@ -127,7 +133,7 @@ def spawn_pi_window(
 		"-F",
 		"#{window_id}",
 		"-t",
-		f"{placement.session_name}:",
+		f"{placement.session_id}:",
 		"-n",
 		window_name,
 		"-e",
@@ -172,6 +178,7 @@ def _build_pi_command(
 	model: str | None,
 	thinking: str | None,
 	session_name: str | None = None,
+	session_file: str | None = None,
 ) -> str:
 	"""Command for the tmux window.
 
@@ -185,6 +192,8 @@ def _build_pi_command(
 	"""
 	pi = shutil.which("pi") or "pi"
 	parts = [shlex.quote(pi)]
+	if session_file:
+		parts += ["--session", shlex.quote(session_file)]
 	if session_name:
 		parts += ["--name", shlex.quote(session_name)]
 	if model:
@@ -207,11 +216,13 @@ def window_alive(window_id: str) -> bool:
 	return window_id in windows
 
 
-def kill_window(window_id: str) -> None:
+def kill_window(window_id: str) -> bool:
+	"""Best-effort cleanup, with an acknowledgement for conservative hibernation."""
 	try:
 		tmux("kill-window", "-t", window_id)
 	except Exception:
-		pass
+		return False
+	return True
 
 
 @dataclass

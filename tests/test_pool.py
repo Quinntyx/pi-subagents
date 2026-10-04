@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
 import os
 import sys
 import threading
@@ -55,15 +54,26 @@ class FakeLiveFactory:
 			self.counter += 1
 			name = f"fake{self.counter}"
 		server = FakePiSockServer(self.tmp_path, name)
-		stamps = itertools.count(self.counter)
-		# A fresh timestamp per read, so a retained session's follow-up turn is
-		# never mistaken for the pre-existing message baseline.
+		# Initial prompt is already accepted/completed by this fake process.
+		# Repeated reads are stable; only a new turn advances the outcome marker.
 		reply_text = "{}" if kwargs.get("schema") is not None and self.reply == "hello" else self.reply
-		server.behaviors["message"] = lambda: {"content": reply_text, "timestamp": next(stamps)}
+		server.complete_turn(reply_text)
+
+		def send(command):
+			busy = self.gate is not None and not self.gate.is_set()
+			if command.get("mode") == "steer" and busy:
+				return {"delivered": True, "mode": "steer"}
+			server.complete_turn(reply_text)
+			return {"delivered": True, "mode": "follow_up" if busy else "direct"}
+
+		server.behaviors["send"] = send
 		live = LiveHandle(prompt, name=kwargs.get("name") or name, cwd=kwargs.get("cwd") or self.tmp_path,
 			window_name=kwargs.get("name") or name, model=kwargs.get("model"), thinking=None, schema=kwargs.get("schema"))
-		ref = type("Ref", (), {"window_id": f"{name}-win", "socket_path": server.sock_path, "name": live.name})()
+		ref = type("Ref", (), {"window_id": f"@fake-pool-{name}", "socket_path": server.sock_path, "name": live.name})()
 		live._bind(ref)
+		live._startup_started = True
+		live._ready.set_result(None)
+		live.status = "running"
 		factory_renamed = self.renamed
 		factory_resumed = self.resumed
 		original_rename = live.set_session_name
@@ -78,7 +88,6 @@ class FakeLiveFactory:
 			factory_resumed.append((live.name, prompt or ""))
 			return original_resume(prompt)
 		live.resume = track_resume  # type: ignore[method-assign]
-		server.behaviors["state"] = {"isIdle": True, "hasPendingMessages": False}
 
 		original_reply = server._reply
 
@@ -104,6 +113,13 @@ class FakeLiveFactory:
 		return live
 
 
+@pytest.fixture(autouse=True)
+def _retain_fake_windows(monkeypatch):
+	# These compatibility tests exercise retained-window reuse, not unloading.
+	# The dedicated lifecycle runtime owns success-only hibernation coverage.
+	monkeypatch.setattr(handle_mod, "unload_window", lambda window_id: False)
+
+
 @pytest.fixture()
 def instant_factory(tmp_path, monkeypatch):
 	"""Fake spawn wired into the handle module for the duration of the test."""
@@ -122,6 +138,32 @@ def instant_factory(tmp_path, monkeypatch):
 
 def run(coro):
 	return asyncio.run(coro)
+
+
+def test_fake_protocol_distinguishes_active_steer_from_new_turn(tmp_path):
+	from pi_subagents.client import _assistant_outcome_marker
+
+	gate = threading.Event()
+	factory = FakeLiveFactory(tmp_path, gate=gate)
+	live = factory.make("first")
+	server = factory.servers[0]
+	try:
+		baseline = live._sync.message()
+		marker = _assistant_outcome_marker(server.session_path)
+		assert live._sync.message() == baseline
+		assert live.send("steer active turn")["mode"] == "steer"
+		assert live._sync.message() == baseline
+		assert _assistant_outcome_marker(server.session_path) == marker
+		assert live.state()["isIdle"] is False
+
+		assert live.send("next turn", mode="follow_up")["delivered"] is True
+		assert live._sync.message() != baseline
+		assert _assistant_outcome_marker(server.session_path) != marker
+		gate.set()
+		assert live.state()["isIdle"] is True
+	finally:
+		gate.set()
+		server.close()
 
 
 def test_submit_pop_and_result_roundtrip(tmp_path, instant_factory):
@@ -352,6 +394,11 @@ def test_session_reuse_runs_followup_on_same_window(tmp_path, instant_factory):
 		first_result = run(pool.pop(timeout=10))
 		assert first_result is not None and (first_result.status == "settled")
 		source_live = first._live
+		server = factory.servers[0]
+		baseline = source_live._sync.message()
+		from pi_subagents.client import _assistant_outcome_marker
+		outcome_baseline = _assistant_outcome_marker(server.session_path)
+		assert source_live._sync.message() == baseline, "reads must not invent turns"
 		followup = stage.submit(
 			Task("second prompt", name="followup"),
 			parent=first_result,
@@ -363,6 +410,11 @@ def test_session_reuse_runs_followup_on_same_window(tmp_path, instant_factory):
 		assert second_result is not None and (second_result.status == "settled")
 		assert second_result.handle is followup
 		assert followup._live is source_live, "the same pi session must be reused"
+		assert len(factory.spawned) == 1
+		assert source_live._sync.message() != baseline
+		assert _assistant_outcome_marker(server.session_path) != outcome_baseline
+		latest_send = next(command for command in reversed(server.sent) if command.get("type") == "send")
+		assert latest_send["mode"] == "follow_up"
 		assert any(r[1] == "renamed-owner" for r in factory.renamed)
 		assert factory.resumed and factory.resumed[-1][1] == "second prompt"
 		# original handle/result remain settled and untouched
@@ -370,6 +422,7 @@ def test_session_reuse_runs_followup_on_same_window(tmp_path, instant_factory):
 
 
 def test_session_reuse_validates_config_and_reservation(tmp_path, instant_factory):
+	factory, _ = instant_factory
 	with AgentPool(concurrency=1) as pool:
 		stage = pool.stage("chat", slots=1)
 		handle = stage.submit(Task("first", name="owner", model="provider/a"))
@@ -386,6 +439,9 @@ def test_session_reuse_validates_config_and_reservation(tmp_path, instant_factor
 			stage.submit(Task("third"), session_handle=handle)
 		assert run(pool.pop(timeout=10)) is not None
 		_ = ok, queued_followup
+		assert len(factory.spawned) == 1
+		assert [command["text"] for command in factory.servers[0].sent
+		        if command["type"] == "send"] == ["again", "fourth"]
 		# a foreign pool must not be reservable; it raised mid-block, so this
 		# one uses an explicit close (with-statements keep pools alive on
 		# exceptions by design).

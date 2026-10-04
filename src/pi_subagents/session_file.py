@@ -33,6 +33,10 @@ class AgentSession:
 	def _resolve_session_file(self) -> str | None:
 		if self._session_file:
 			return self._session_file
+		path = getattr(self._handle, "session_file", None)
+		if path:
+			self._session_file = path
+			return path
 		if not self._handle.socket_path:
 			return None
 		# The session file only exists once pi has started and taken the prompt.
@@ -193,7 +197,7 @@ class AgentSession:
 	def invalidate(self) -> None:
 		"""Drop the parsed cache (e.g. after resume() added new turns)."""
 		self._parsed = None
-		self._session_file = None
+		# A session's identity survives cache refresh and process hibernation.
 
 
 def _to_ms(value: Any) -> int | None:

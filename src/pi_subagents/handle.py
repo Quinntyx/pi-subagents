@@ -17,14 +17,16 @@ from typing import Any
 
 from .client import (
 	AsyncSockClient, PiSockError, PiSockSessionEnded, PiSockUnavailable, SockClient,
-	raise_for_failed_outcome,
+	_last_assistant_outcome, _assistant_outcome_marker, raise_for_failed_outcome,
 )
 from .errors import PiSubagentsError, PiSubagentsTimeoutError
 from .envcheck import require_environment
 from .registry import REGISTRY
 from .response import AgentDictResponse, AgentStrResponse
 from .schema import SchemaValidationError, validate_schema, validate_with_schema
-from .tmuxenv import kill_window, spawn_pi_window, unique_socket_name, window_alive
+from .tmuxenv import (
+	kill_window, resolve_agent_dir, spawn_pi_window, unique_socket_name, window_alive,
+)
 
 DEFAULT_SETTLE_TIMEOUT = 30 * 60.0
 # How long to wait for a freshly spawned pi to bring its pi-sock socket up and
@@ -44,6 +46,16 @@ def _startup_timeout() -> float:
 		return max(5.0, float(os.environ.get("PI_SUBAGENTS_STARTUP_TIMEOUT", str(DEFAULT_STARTUP_TIMEOUT))))
 	except ValueError:
 		return DEFAULT_STARTUP_TIMEOUT
+
+
+def unload_window(window_id: str) -> bool:
+	"""Confirm cleanup without mistaking an unreachable tmux server for success.
+
+	Keep kill_window as the underlying boundary for existing wrappers, including
+	older wrappers returning None; the built-in reports explicit command failure.
+	"""
+	killed = kill_window(window_id)
+	return killed is not False and not window_alive(window_id)
 
 
 class AgentHandle:
@@ -90,6 +102,14 @@ class AgentHandle:
 		self.settled_data: dict | None = None
 		self.window_id: str | None = None
 		self.socket_path: str | None = None
+		self.session_file: str | None = None
+		self.session_id: str | None = None
+		self.last_outcome: str | None = None
+		self._dormant = False
+		self._cached_state: dict = {}
+		self._cached_activity: dict | None = None
+		self._agent_dir: str | os.PathLike[str] | None = None
+		self._depth = int(os.environ.get("PI_SUBAGENT_DEPTH", "0") or 0) + 1
 		# Latest pi-activity API snapshot (filled by activity polling).
 		self.phase: str | None = None
 		self.label: str | None = None
@@ -108,6 +128,7 @@ class AgentHandle:
 		# Message present immediately before a follow-up is sent. Settlement must
 		# produce a different message so a retained session cannot return stale data.
 		self._wait_baseline: dict | None = None
+		self._settlement_revision = 0
 		# Readiness/delivery of the initial prompt (see _run_startup).
 		self._ready: concurrent.futures.Future = concurrent.futures.Future()
 		self._startup_error: Exception | None = None
@@ -149,9 +170,8 @@ class AgentHandle:
 
 		if not self._startup_started:
 			return
-		loop = asyncio.get_running_loop()
 		await asyncio.wait_for(
-			asyncio.wrap_future(self._ready),
+			asyncio.shield(asyncio.wrap_future(self._ready)),
 			timeout=timeout if timeout is not None else _startup_timeout() + 5.0,
 		)
 		if self._startup_error is not None:
@@ -164,8 +184,7 @@ class AgentHandle:
 
 		Runs in a daemon thread so spawn() stays instant. The handle's control
 		methods wait on `_ready`, so a follow-up steer can never overtake the
-		initial prompt. A window that never comes up is killed rather than
-		orphaned.
+		initial prompt. Startup failures retain their windows for inspection.
 		"""
 		try:
 			deadline = time.monotonic() + _startup_timeout()
@@ -173,7 +192,7 @@ class AgentHandle:
 				if self._killed:
 					return
 				try:
-					self._sync.state()
+					self._remember_state(self._sync.state())
 					break  # pi-sock answers: session started, UI is coming up
 				except PiSockUnavailable:
 					if not self.is_window_alive():
@@ -188,13 +207,9 @@ class AgentHandle:
 			self.status = "running"
 		except Exception as error:
 			self._startup_error = error
-			# Never leave a window behind for a subagent we cannot talk to; kill()
-			# marks it dead, so the informative status is restored afterwards.
-			try:
-				self.kill()
-			except Exception:
-				pass
 			self.status = "failed"
+			self.last_outcome = "failed"
+			self._stamp_runtime()
 		finally:
 			if not self._ready.done():
 				self._ready.set_result(None)
@@ -246,6 +261,10 @@ class AgentHandle:
 			"busyMs": busy_ms,
 			"socketPath": self.socket_path,
 			"windowId": self.window_id,
+			"sessionFile": self.session_file,
+			"sessionId": self.session_id,
+			"dormant": self._dormant,
+			"lastOutcome": self.last_outcome,
 			"toolCalls": self.tool_calls,
 			"thinkingMs": self.thinking_ms,
 			"phase": self.phase,
@@ -299,41 +318,39 @@ class AgentHandle:
 		return result
 
 	def resume(self, prompt: str | None = None) -> "AgentHandle":
-		"""Start a pool-scheduled follow-up on this retained pi session."""
+		"""Start a pool-scheduled follow-up, reopening only a dormant session."""
 		if not self.closed and self.status not in ("stopped", "failed", "dead", "settled"):
 			raise ValueError("resume on a handle that is still running; abort it first")
+		text = prompt if prompt is not None else "Continue."
+		if self._dormant:
+			return self._reopen(text)
+		# A failed first delivery is a past turn's error, not permanent poison
+		# for an otherwise live session. Never respawn it: retry normal control
+		# only when the scheduler has admitted this explicitly requested turn.
+		if self._startup_started:
+			self._ready.result(timeout=_startup_timeout() + 5)
+		self._startup_error = None
 		self._await_ready()
+		self._capture_outcome_baseline()
 		try:
 			self._wait_baseline = self._sync.message()
 		except PiSockError:
 			self._wait_baseline = None
-		self.closed = False
-		self.settled_data = None
-		self.runtime_ms = None
-		self.started_at = time.time() * 1000
-		self._busy_ms = 0.0
-		self._busy_since = self.started_at
-		self._idle = False
-		if self._session is not None:
-			self._session.invalidate()
-		self._session = None
+		self._reset_turn()
+		self.prompt = text
 		self.status = "running"
 		REGISTRY.emit()
-		text = prompt if prompt is not None else "Continue."
 		try:
 			self._sync.send(text, mode="follow_up")
 		except PiSockUnavailable:
 			self._mark_dead()
+			raise
 		return self
 
 	async def resume_async(self, prompt: str | None = None) -> "AgentHandle":
-		if not self.closed and self.status not in ("stopped", "failed", "dead", "settled"):
-			raise ValueError("resume on a handle that is still running; abort it first")
-		await self._await_ready_async()
-		try:
-			self._wait_baseline = await self._async.message()
-		except PiSockError:
-			self._wait_baseline = None
+		return await asyncio.to_thread(self.resume, prompt)
+
+	def _reset_turn(self) -> None:
 		self.closed = False
 		self.settled_data = None
 		self.runtime_ms = None
@@ -341,17 +358,85 @@ class AgentHandle:
 		self._busy_ms = 0.0
 		self._busy_since = self.started_at
 		self._idle = False
+		self.last_outcome = None
+		# Freeze historical inspection before the continuation appends new turns.
 		if self._session is not None:
-			self._session.invalidate()
+			self._session._load()
 		self._session = None
+
+	def _prepare_accepted_deliveries(self, deliveries: tuple) -> None:
+		"""Re-wait accepted direct turns without respawning or releasing capacity."""
+		self.settled_data = None
+		self._wait_baseline = None
+		self.last_outcome = None
 		self.status = "running"
-		REGISTRY.emit()
-		text = prompt if prompt is not None else "Continue."
-		try:
-			await self._async.send(text, mode="follow_up")
-		except PiSockUnavailable:
-			self._mark_dead()
+		self.runtime_ms = None
+		self.session.invalidate()
+		for client in (self._sync, self._async):
+			client._after_outcome = None
+			client._after_deliveries = deliveries
+
+	def _capture_outcome_baseline(self) -> None:
+		marker = _assistant_outcome_marker(self.session_file)
+		self._sync._after_outcome = marker
+		self._async._after_outcome = marker
+		self._sync._after_deliveries = None
+		self._async._after_deliveries = None
+
+	def _reopen(self, prompt: str) -> "AgentHandle":
+		if not self.session_file or not os.path.isfile(self.session_file):
+			raise PiSubagentsError(f"subagent {self.name}: durable session file is unavailable")
+		baseline = (self.settled_data or {}).get("lastAssistant")
+		window_ref = spawn_pi_window(
+			prompt, name=self.name, cwd=self.cwd, window_name=self.window_name,
+			model=self._cached_state.get("model") or self.model,
+			thinking=self._cached_state.get("thinkingLevel") or self.thinking,
+			socket_name=unique_socket_name(self.name), depth=self._depth,
+			agentDir=self._agent_dir, session_file=self.session_file,
+		)
+		self.prompt = prompt
+		self._reset_turn()
+		self._wait_baseline = baseline
+		self._dormant = False
+		self._ready = concurrent.futures.Future()
+		self._startup_error = None
+		self._killed = False
+		self._bind(window_ref)
+		self._capture_outcome_baseline()
+		self._startup_started = True
+		threading.Thread(target=self._run_startup, name=f"subagent-startup-{self.id}", daemon=True).start()
 		return self
+
+	@property
+	def dormant(self) -> bool:
+		return self._dormant
+
+	def hibernate(self) -> bool:
+		"""Unload only an idle, validated success with a durable terminal outcome."""
+		if self._dormant:
+			return True
+		if self.status != "settled" or self.last_outcome != "ok" or self._killed or self.closed:
+			return False
+		try:
+			state = self.state()
+			if not state.get("isIdle") or state.get("hasPendingMessages"):
+				return False
+			path = self.session.session_file
+			if not path or not os.path.isfile(path):
+				return False
+			outcome = _last_assistant_outcome(path)
+			if outcome is None or outcome[0] not in ("stop", "length"):
+				return False
+			self.session._load()
+			if not self.window_id:
+				return False
+			if not unload_window(self.window_id):
+				return False
+		except Exception:
+			# Inspection/cleanup failures never turn a successful task into a failure.
+			return False
+		self._dormant = True
+		return True
 
 	def set_session_name(self, name: str) -> dict:
 		"""Rename the live pi session; pi updates its terminal title immediately."""
@@ -384,16 +469,32 @@ class AgentHandle:
 
 	# -- observation --------------------------------------------------------
 
+	def _remember_state(self, state: dict) -> dict:
+		self._cached_state = dict(state)
+		path = state.get("sessionFile")
+		if isinstance(path, str) and path:
+			self.session_file = path
+		identity = state.get("sessionId")
+		if isinstance(identity, str) and identity:
+			self.session_id = identity
+		return state
+
 	def state(self) -> dict:
+		if self._dormant:
+			return {**self._cached_state, "dormant": True}
 		self._await_ready()
-		return self._sync.state()
+		return self._remember_state(self._sync.state())
 
 	async def state_async(self) -> dict:
+		if self._dormant:
+			return {**self._cached_state, "dormant": True}
 		await self._await_ready_async()
-		return await self._async.state()
+		return self._remember_state(await self._async.state())
 
 	def activity(self) -> dict | None:
-		"""Latest pi-activity API snapshot (None when the relay is unavailable)."""
+		"""Latest pi-activity API snapshot (cached while dormant)."""
+		if self._dormant:
+			return self._cached_activity
 		self._await_ready()
 		snap = self._sync.activity()
 		if snap and snap.get("available"):
@@ -402,6 +503,8 @@ class AgentHandle:
 		return None
 
 	async def activity_async(self) -> dict | None:
+		if self._dormant:
+			return self._cached_activity
 		await self._await_ready_async()
 		snap = await self._async.activity()
 		if snap and snap.get("available"):
@@ -410,6 +513,7 @@ class AgentHandle:
 		return None
 
 	def _absorb_activity(self, snap: dict) -> None:
+		self._cached_activity = dict(snap)
 		activity = snap.get("activity") or snap
 		self.phase = activity.get("phase")
 		self.label = activity.get("label")
@@ -434,13 +538,15 @@ class AgentHandle:
 		REGISTRY.emit()
 
 	def is_window_alive(self) -> bool:
-		return bool(self.window_id and window_alive(self.window_id))
+		return not self._dormant and bool(self.window_id and window_alive(self.window_id))
 
 	# -- waiting ------------------------------------------------------------
 
 	def wait(self, timeout: float | None = None, poll: float = 1.0) -> Any:
 		"""Block until the agent settles; returns AgentStrResponse/AgentDictResponse."""
-		# A failed startup explains itself before the closed-handle check.
+		# Reject interruption before touching readiness, preserving startup errors.
+		if self.closed and self.status != "settled" and self._startup_error is None:
+			raise ValueError("await on closed handle (it was aborted; call resume() first)")
 		self._await_ready()
 		if self.closed and self.status != "settled":
 			raise ValueError("await on closed handle (it was aborted; call resume() first)")
@@ -455,6 +561,7 @@ class AgentHandle:
 				raise TimeoutError(f"subagent {self.name}: pi-sock socket never appeared")
 		self.awaited = True
 		REGISTRY.emit()
+		revision = self._settlement_revision
 		try:
 			settle = self._sync.wait_settled(
 				timeout if timeout is not None else _settle_timeout_default(),
@@ -465,24 +572,29 @@ class AgentHandle:
 		finally:
 			self.awaited = False
 			REGISTRY.emit()
+		if revision != self._settlement_revision:
+			raise PiSockError("settlement superseded by an accepted direct turn")
 		return self._finish_wait(settle)
 
 	async def wait_async(self, timeout: float | None = None, poll: float = 1.0) -> Any:
-		# A failed startup explains itself before the closed-handle check.
+		# This guard must also work when a coroutine is advanced without a loop.
+		if self.closed and self.status != "settled" and self._startup_error is None:
+			raise ValueError("await on closed handle (it was aborted; call resume_async() first)")
 		await self._await_ready_async()
 		if self.closed and self.status != "settled":
 			raise ValueError("await on closed handle (it was aborted; call resume_async() first)")
 		if self.settled_data is not None:
-			return self._response()
+			return await asyncio.to_thread(self._response)
 		if self.socket_path and not os.path.exists(self.socket_path):
 			# pi may still be booting — the socket appears when the session
 			# starts. wait_settled treats missing sockets as dead, so wait for
 			# the socket to appear first.
-			if not self._await_socket(self.socket_path, timeout):
+			if not await self._await_socket_async(timeout):
 				self._mark_dead()
 				raise TimeoutError(f"subagent {self.name}: pi-sock socket never appeared")
 		self.awaited = True
 		REGISTRY.emit()
+		revision = self._settlement_revision
 		try:
 			settle = await self._async.wait_settled(
 				timeout if timeout is not None else _settle_timeout_default(),
@@ -496,7 +608,11 @@ class AgentHandle:
 		finally:
 			self.awaited = False
 			REGISTRY.emit()
-		return self._finish_wait(settle)
+		if revision != self._settlement_revision:
+			raise PiSockError("settlement superseded by an accepted direct turn")
+		# Validation/repair and disk inspection use synchronous clients; keep them
+		# off the event loop just like scheduled send/resume control.
+		return await asyncio.to_thread(self._finish_wait, settle)
 
 	def __str__(self) -> str:
 		"""The settled response text once available, otherwise a status line."""
@@ -527,8 +643,8 @@ class AgentHandle:
 			time.sleep(0.25)
 		return False
 
-	async def _await_socket_async(self) -> bool:
-		deadline = time.monotonic() + 60.0
+	async def _await_socket_async(self, timeout: float | None = None) -> bool:
+		deadline = time.monotonic() + (timeout or 60.0)
 		while time.monotonic() < deadline:
 			if self.socket_path and os.path.exists(self.socket_path):
 				try:
@@ -536,27 +652,29 @@ class AgentHandle:
 					return True
 				except Exception:
 					pass
-			if not self.is_window_alive():
+			if not await asyncio.to_thread(self.is_window_alive):
 				return False
 			await asyncio.sleep(0.25)
 		return False
 
 	def _absorb_from_state(self, state: dict | None = None) -> None:
+		if state is not None and "sessionFile" in state:
+			self._remember_state(state)
 		self._absorb_execution_state(state)
 		self._absorb_ctx(state)
 		try:
 			self.activity()
 		except Exception:
 			pass
-			pass
 
 	async def _absorb_from_state_async(self, state: dict | None = None) -> None:
+		if state is not None and "sessionFile" in state:
+			self._remember_state(state)
 		self._absorb_execution_state(state)
 		self._absorb_ctx(state)
 		try:
 			await self.activity_async()
 		except Exception:
-			pass
 			pass
 
 	def _tick_sync(self, state: dict) -> None:
@@ -588,13 +706,30 @@ class AgentHandle:
 		self._absorb_from_state(settle)
 		self.settled_data = settle
 		self._wait_baseline = None
-		self.status = "settled"
-		self._stamp_runtime()
+		# Validation and bounded repair follow-ups are part of the active turn.
+		# Do not expose a terminal state (or freeze its runtime) prematurely.
+		self.status = "running"
 		REGISTRY.emit()
 		try:
-			return self._response()
+			response = self._response()
+			raise_for_failed_outcome(
+				self.session.session_file,
+				last_message=(self.settled_data or {}).get("lastAssistant"),
+			)
+			if self.closed:
+				raise PiSockSessionEnded(f"subagent {self.name}: interrupted during validation")
+			outcome = _last_assistant_outcome(self.session.session_file)
+			last_message = (self.settled_data or {}).get("lastAssistant") or {}
+			stop = outcome[0] if outcome is not None else last_message.get("stopReason")
+			self.last_outcome = "ok" if stop in ("stop", "length") else "unknown"
+			self.status = "settled"
+			self._stamp_runtime()
+			REGISTRY.emit()
+			return response
 		except Exception:
+			self.last_outcome = "failed"
 			self.status = "failed"
+			self._stamp_runtime()
 			REGISTRY.emit()
 			raise
 
@@ -648,6 +783,11 @@ def _dict_response(handle: AgentHandle, text: str, session) -> "AgentDictRespons
 		# rejected reply briefly after the repair prompt has been accepted.
 		baseline = (handle.settled_data or {}).get("lastAssistant")
 		_raise_for_failed_schema_turn(handle, session)
+		# Real handles correlate both the durable outcome and the wire reply;
+		# a repair can finish at the provider without producing new text.
+		capture = getattr(handle, "_capture_outcome_baseline", None)
+		if capture is not None:
+			capture()
 		handle.send(_schema_retry_prompt(handle.schema, error), mode="follow_up")
 		settle = handle._sync.wait_settled(
 			_settle_timeout_default(), after_message=baseline,
@@ -741,6 +881,8 @@ def spawn_pi_window_handle(
 		thinking=thinking,
 		schema=schema,
 	)
+	handle._agent_dir = str(resolve_agent_dir(agentDir))
+	handle._depth = depth
 	window_ref = spawn_pi_window(
 		prompt,
 		name=handle.name,
@@ -750,7 +892,7 @@ def spawn_pi_window_handle(
 		thinking=handle.thinking,
 		socket_name=handle.id,
 		depth=depth,
-		agentDir=agentDir,
+		agentDir=handle._agent_dir,
 		session_name=session_name,
 	)
 	handle.group = group

@@ -22,7 +22,7 @@ from .errors import (
 from .registry import REGISTRY, current_exec_scope
 from .result import AgentResult
 from .task import Task
-from .tmuxenv import max_concurrent
+from .tmuxenv import max_concurrent, resolve_agent_dir
 
 if TYPE_CHECKING:  # pragma: no cover
 	from .handle import AgentHandle as _LiveSession
@@ -35,14 +35,17 @@ class _GlobalCapacity:
 		self._condition = threading.Condition()
 		self._active = 0
 
-	def acquire(self, pool: "AgentPool") -> bool:
+	def acquire(self, pool: "AgentPool", handle: "AgentHandle") -> bool:
 		with self._condition:
-			while self._active >= max_concurrent():
-				if pool.closed:
+			while True:
+				# Admission must not wake/spawn closed or already-cancelled work,
+				# even when the active ceiling has just become available.
+				if pool.closed or handle._future.done():
 					return False
+				if self._active < max_concurrent():
+					self._active += 1
+					return True
 				self._condition.wait(0.25)
-			self._active += 1
-			return True
 
 	def release(self) -> None:
 		with self._condition:
@@ -67,6 +70,7 @@ class _Job:
 	session_handle: "AgentHandle | None"
 	session_name: str | None
 	dispatched: bool = False
+	execution_started: bool = False
 
 
 class AgentHandle:
@@ -90,9 +94,15 @@ class AgentHandle:
 		self._future: concurrent.futures.Future[AgentResult] = concurrent.futures.Future()
 		self._live: _LiveSession | None = None
 		self._session_config: dict[str, Any] | None = None
+		self._inspection_session = None
+		# In-memory correlation only: existing disk entries identify accepted
+		# direct deliveries; this list is guarded by the session control lock.
+		self._direct_deliveries: list[tuple[int | None, str]] = []
 		self._invalidated = False
 		self._awaited = False
 		self._cancel_requested = False
+		self._abort_after_ready = False
+		self._control_lock = threading.RLock()
 
 	@property
 	def status(self) -> str:
@@ -147,17 +157,64 @@ class AgentHandle:
 		return self.wait_async().__await__()
 
 	def send(self, text: str, mode: str = "steer") -> dict:
-		"""Steer the currently running turn; follow-ups must use stage.submit()."""
+		"""Steer active work, or schedule a new turn on a terminal handle.
+
+		Scheduled acknowledgements contain ``handle`` and ``handleId``. Await
+		that new handle or consume its completion through the usual pool.pop().
+		The original handle/result and round metadata remain unchanged.
+		"""
+		if mode not in ("steer", "follow_up"):
+			raise ValueError("send mode must be 'steer' or 'follow_up'")
 		live = self._require_live("send")
-		if self._status not in ("starting", "running"):
-			raise ValueError("send is only valid while this task is running")
-		return live.send(text, mode=mode)
+		# Serialize control with completion, without holding the pool condition
+		# during socket I/O. An idle pi may have completed before its worker has
+		# published the result; sending directly then would start an untracked
+		# turn outside capacity admission. Let that terminal transition finish.
+		deadline = time.monotonic() + 15.0
+		while True:
+			with self._control_lock:
+				with self.pool._condition:
+					self._ensure_valid()
+					active = self._status in ("starting", "running")
+					if not active and self._status not in ("settled", "failed", "cancelled"):
+						raise ValueError("send requires a running or terminal task")
+				if not active:
+					break
+				if live.status in ("starting", "running") and not live.closed:
+					state = live.state()
+					if not state.get("isIdle") or state.get("hasPendingMessages"):
+						try:
+							offset = os.path.getsize(state.get("sessionFile") or live.session_file)
+						except (OSError, TypeError):
+							offset = None
+						receipt = live.send(text, mode=mode)
+						if receipt.get("mode") == "direct":
+							# pi finished between inspection and acceptance. Publication
+							# takes this same lock and must re-wait the accepted turn.
+							self._direct_deliveries.append((offset, text))
+							live._settlement_revision += 1
+						return receipt
+			# Completion/hibernation needs the session lock, so never wait while
+			# holding it. Recheck activity if validation starts a repair turn.
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				raise TimeoutError("session completion is still pending; retry send after its result")
+			try:
+				self._future.result(timeout=min(0.1, remaining))
+			except concurrent.futures.TimeoutError:
+				pass
+		followup = self.stage.submit(
+			Task(text, name=self.name, schema=self.task.schema,
+			     timeout=self.task.timeout, metadata=self.task.metadata),
+			parent=self.result, session_handle=self,
+		)
+		return {"scheduled": True, "handle": followup, "handleId": followup.id,
+		        "status": "queued"}
 
 	async def send_async(self, text: str, mode: str = "steer") -> dict:
-		live = self._require_live("send")
-		if self._status not in ("starting", "running"):
-			raise ValueError("send is only valid while this task is running")
-		return await live.send_async(text, mode=mode)
+		# A worker thread keeps socket readiness/steering off the event loop, and
+		# serializes send against completion/hibernation with a per-session lock.
+		return await asyncio.to_thread(self.send, text, mode)
 
 	def cancel(self) -> bool:
 		"""Cancel queued work or abort the currently running turn."""
@@ -183,7 +240,11 @@ class AgentHandle:
 
 	def get_session(self):
 		result = self.result
-		return result.session if result is not None else None
+		if result is not None and result.session is not None:
+			return result.session
+		return self._inspection_session if self._inspection_session is not None else (
+			self._live.session if self._live is not None else None
+		)
 
 	def agent_state(self) -> dict:
 		now = time.time() * 1000
@@ -202,6 +263,10 @@ class AgentHandle:
 			"busyMs": round(elapsed or 0),
 			"socketPath": None,
 			"windowId": None,
+			"sessionFile": None,
+			"sessionId": None,
+			"dormant": False,
+			"lastOutcome": None,
 			"toolCalls": 0,
 			"thinkingMs": 0,
 			"phase": None,
@@ -218,14 +283,17 @@ class AgentHandle:
 			for key in (
 				"socketPath", "windowId", "toolCalls", "thinkingMs", "phase", "label",
 				"labelElapsedMs", "labelCalls", "liveTool", "ctx", "depth", "idle",
-				"elapsedMs", "busyMs",
+				"elapsedMs", "busyMs", "sessionFile", "sessionId", "dormant", "lastOutcome",
 			):
 				base[key] = live.get(key)
 		return base
 
 	def _bind_live(self, live: "_LiveSession", config: dict[str, Any]) -> None:
-		self._live = live
-		self._session_config = config
+		with self.pool._condition:
+			self._live = live
+			self._session_config = config
+			self._inspection_session = live.session
+			self._control_lock = self.pool._session_locks.setdefault(id(live), threading.RLock())
 
 	def _ensure_valid(self) -> None:
 		if self.closed:
@@ -386,6 +454,7 @@ class AgentPool:
 		self._jobs_by_handle: dict[str, _Job] = {}
 		self._results: deque[AgentResult] = deque()
 		self._reserved_sessions: dict[int, str] = {}
+		self._session_locks: dict[int, threading.RLock] = {}
 		self._agent_ms = 0
 		self._tool_calls = 0
 		self.last_summary: PoolSummary | None = None
@@ -644,8 +713,8 @@ class AgentPool:
 			raise SessionReuseError("session handle belongs to another pool")
 		if source.closed or source._live is None:
 			raise SessionReuseError("session handle is invalid or has not started")
-		if source.status != "settled":
-			raise SessionReuseError("session reuse requires a settled handle")
+		if source.status not in ("settled", "failed", "cancelled"):
+			raise SessionReuseError("session reuse requires a terminal handle")
 		key = id(source._live)
 		if key in self._reserved_sessions:
 			raise SessionReuseError("this session already has a queued or running follow-up")
@@ -654,7 +723,7 @@ class AgentPool:
 			"model": task.model,
 			"thinking": task.thinking,
 			"cwd": os.path.abspath(task.cwd) if task.cwd else None,
-			"agentDir": os.path.abspath(task.agentDir) if task.agentDir else None,
+			"agentDir": os.path.abspath(resolve_agent_dir(task.agentDir)) if task.agentDir else None,
 		}
 		for field, requested in checks.items():
 			if requested is not None and requested != config.get(field):
@@ -671,27 +740,51 @@ class AgentPool:
 			job = self._jobs_by_handle.get(handle.id)
 			if job is None or handle._future.done():
 				return False
-			if handle._status == "queued":
-				try:
-					job.stage._queue.remove(job)
-				except ValueError:
-					return False
+			if not job.execution_started:
+				if not job.dispatched:
+					try:
+						job.stage._queue.remove(job)
+					except ValueError:
+						return False
+				# A worker can be 'starting' while blocked on process-wide
+				# capacity. Cancel it without delivering a prompt or waking pi.
 				handle._cancel_requested = True
 				self._finish_job_locked(job, body=None, error=None, status="cancelled")
 				self._condition.notify_all()
-				wake = True
+				queued = True
 			else:
-				handle._cancel_requested = True
+				queued = False
 				live = handle._live
-				wake = False
-		if wake:
+				if live is None:
+					handle._cancel_requested = True
+					return True  # startup will observe this before waiting
+		if queued:
+			_GLOBAL_CAPACITY.wake()
 			REGISTRY.emit()
 			return True
-		if live is not None:
-			try:
-				live.abort()
-			except Exception:
-				pass
+		with handle._control_lock:
+			with self._condition:
+				self._ensure_open()
+				if handle._future.done():
+					return False
+				handle._cancel_requested = True
+			def abort_ready(_=None):
+				with handle._control_lock:
+					if not handle._abort_after_ready:
+						return
+					try:
+						live.abort()
+					except Exception:
+						pass
+					handle._abort_after_ready = False
+
+			handle._abort_after_ready = True
+			if live._startup_started and not live._ready.done():
+				# An early abort RPC can precede first-prompt delivery. Abort
+				# after shared readiness instead; retain the admitted slot/window.
+				live._ready.add_done_callback(abort_ready)
+			else:
+				abort_ready()
 		return True
 
 	def _worker(self) -> None:
@@ -699,8 +792,10 @@ class AgentPool:
 			job = self._take_job()
 			if job is None:
 				return
-			if not _GLOBAL_CAPACITY.acquire(self):
-				return
+			if not _GLOBAL_CAPACITY.acquire(self, job.handle):
+				if self.closed:
+					return
+				continue
 			try:
 				self._execute(job)
 			finally:
@@ -733,6 +828,10 @@ class AgentPool:
 
 	def _execute(self, job: _Job) -> None:
 		handle = job.handle
+		with self._condition:
+			if self._closed or handle._future.done():
+				return
+			job.execution_started = True
 		try:
 			if job.session_handle is None:
 				live, config = self._spawn_new(job)
@@ -740,6 +839,10 @@ class AgentPool:
 				live, config = self._reuse_session(job)
 			with self._condition:
 				closed_during_startup = self._closed
+				if not closed_during_startup:
+					# close() must see every newly spawned session before waiting.
+					handle._bind_live(live, config)
+					handle._status = "running"
 			if closed_during_startup:
 				# close() ran while this spawn was in flight; the window exists
 				# now, so destroy it here instead of leaking it.
@@ -748,38 +851,134 @@ class AgentPool:
 				except Exception:
 					pass
 				return
-			handle._bind_live(live, config)
-			handle._status = "running"
 			REGISTRY.emit()
-			body = live.wait(timeout=job.task.timeout)
-			status = "cancelled" if handle._cancel_requested else "settled"
-			error = None
+			if handle._cancel_requested:
+				live._await_ready()
+				live.abort()
+			self._settle_job(job, live)
+			return
 		except BaseException as caught:
 			body = None
 			error = caught
 			status = "cancelled" if handle._cancel_requested else "failed"
-			if handle._live is not None and isinstance(caught, TimeoutError):
+			if handle._live is not None:
+				live = handle._live
 				try:
-					handle._live.abort()
+					live._remember_state(live._sync.state())
 				except Exception:
 					pass
-		with self._condition:
-			if not self._closed:
-				self._finish_job_locked(job, body=body, error=error, status=status)
-			elif handle._live is not None:
+				if isinstance(caught, TimeoutError):
+					try:
+						live.abort()
+					except Exception:
+						pass
+				live.status = "failed" if status == "failed" else "stopped"
+				live.last_outcome = status
+				live._stamp_runtime()
+		self._publish_job(job, body=body, error=error, status=status)
+
+	def _publish_job(self, job: _Job, *, body, error, status: str) -> None:
+		handle = job.handle
+		with handle._control_lock:
+			with self._condition:
+				# Cancellation can land after wait()/schema validation returned.
+				# The per-session lock makes this the terminal transition boundary.
+				if handle._cancel_requested:
+					status = "cancelled"
+				closed = self._closed
+			if status == "cancelled" and handle._live is not None:
+				if handle._abort_after_ready:
+					# Readiness may wake a worker before its abort callback obtains
+					# this lock; publication must not race initial prompt delivery.
+					try:
+						handle._live._await_ready()
+						handle._live.abort()
+					except Exception:
+						pass
+					handle._abort_after_ready = False
+				handle._live.last_outcome = "cancelled"
+				handle._live.status = "stopped"
+				handle._live._stamp_runtime()
+			if handle._live is not None:
+				# Freeze inspection for every outcome, not only responses. A
+				# failed/cancelled result must not become its continuation's log.
+				handle._inspection_session = handle._live.session
+				try:
+					handle._inspection_session.invalidate()
+					handle._inspection_session._load()
+				except Exception:
+					pass
+			if not closed and status == "settled" and error is None and handle._live is not None:
+				try:
+					handle._live.hibernate()
+				except Exception:
+					pass
+			with self._condition:
+				closed = self._closed
+				if not closed:
+					self._finish_job_locked(job, body=body, error=error, status=status)
+				self._condition.notify_all()
+			if closed and handle._live is not None:
 				try:
 					handle._live.kill()
 				except Exception:
 					pass
-			self._condition.notify_all()
 		REGISTRY.emit()
+
+	def _settle_job(self, job: _Job, live: "_LiveSession") -> None:
+		from .handle import _settle_timeout_default
+
+		handle = job.handle
+		timeout = job.task.timeout if job.task.timeout is not None else _settle_timeout_default()
+		deadline = time.monotonic() + timeout
+		revision = -1
+		while True:
+			with handle._control_lock:
+				current = len(handle._direct_deliveries)
+				if current and revision != current:
+					live._prepare_accepted_deliveries(tuple(handle._direct_deliveries))
+				revision = current
+			try:
+				remaining = deadline - time.monotonic()
+				if remaining <= 0:
+					raise TimeoutError(f"subagent {handle.name}: accepted turn did not settle in time")
+				body = live.wait(timeout=remaining)
+				error, status = None, "settled"
+			except BaseException as caught:
+				body, error, status = None, caught, "failed"
+			with handle._control_lock:
+				with self._condition:
+					cancelled, closed = handle._cancel_requested, self._closed
+				# A direct acceptance supersedes even an old failure/timeout. Do
+				# not abort the new turn or publish/release its slot prematurely.
+				if not cancelled and not closed and len(handle._direct_deliveries) != revision:
+					continue
+				if cancelled:
+					status = "cancelled"
+				if error is not None:
+					try:
+						live._remember_state(live._sync.state())
+					except Exception:
+						pass
+					if isinstance(error, TimeoutError):
+						try:
+							live.abort()
+						except Exception:
+							pass
+					live.status = "failed" if status == "failed" else "stopped"
+					live.last_outcome = status
+					live._stamp_runtime()
+				# Check the generation and publish under one session lock. No
+				# pool-wide lock is held across waiting, RPC, or hibernation.
+				self._publish_job(job, body=body, error=error, status=status)
+				return
 
 	def _spawn_new(self, job: _Job) -> tuple["_LiveSession", dict[str, Any]]:
 		from .handle import spawn_pi_window_handle
 
 		task = job.task
 		cwd = os.path.abspath(task.cwd or os.getcwd())
-		agent_dir = os.path.abspath(task.agentDir) if task.agentDir else None
+		agent_dir = os.path.abspath(resolve_agent_dir(task.agentDir))
 		live = spawn_pi_window_handle(
 			task.prompt,
 			name=job.handle.name,
@@ -805,11 +1004,16 @@ class AgentPool:
 		source = job.session_handle
 		assert source is not None and source._live is not None
 		live = source._live
-		if job.session_name is not None:
-			live.set_session_name(job.session_name)
-		live.schema = job.task.schema
-		live.resume(job.task.prompt)
-		return live, dict(source._session_config or {})
+		config = dict(source._session_config or {})
+		# Bind before resume/rename: startup or delivery failures must still
+		# expose the retained window/session on the new failed task handle.
+		with source._control_lock:
+			job.handle._bind_live(live, config)
+			live.schema = job.task.schema
+			live.resume(job.task.prompt)
+			if job.session_name is not None:
+				live.set_session_name(job.session_name)
+		return live, config
 
 	def _finish_job_locked(self, job: _Job, *, body, error, status: str) -> AgentResult:
 		now = time.time() * 1000
