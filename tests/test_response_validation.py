@@ -25,12 +25,13 @@ def fake_handle(replies):
     def send(prompt, mode):
         prompts.append((prompt, mode))
 
-    def wait_settled(timeout, after_message=None):
+    def wait_settled(timeout, after_message=None, on_tick=None):
         baselines.append(after_message)
         reply = next(replies)
         if reply is None:
             return None
-        return {"lastAssistant": {"content": reply, "timestamp": len(baselines)}}
+        message = reply if isinstance(reply, dict) else {"content": reply}
+        return {"lastAssistant": {**message, "timestamp": len(baselines)}}
 
     handle = SimpleNamespace(
         name="schema-job", schema=SCHEMA, session=session,
@@ -99,3 +100,105 @@ def test_legacy_result_and_pool_flags_are_removed():
     assert not hasattr(AgentResult, "ok")
     assert not hasattr(AgentResult, "unwrap")
     assert "valid" not in inspect.signature(AgentDictResponse).parameters
+
+
+@pytest.mark.parametrize("content", ["partial reply", '{"summary": "done"}'])
+@pytest.mark.parametrize("retries", ["0", "3"])
+def test_aborted_reply_never_requests_schema_repair(monkeypatch, content, retries):
+    from pi_subagents.client import PiSockSessionEnded
+    monkeypatch.setenv("PI_SUBAGENTS_SCHEMA_RETRIES", retries)
+    handle, session, prompts, _ = fake_handle([])
+    handle.settled_data["lastAssistant"].update(
+        content=content, stopReason="aborted", errorMessage="Operation aborted",
+    )
+    with pytest.raises(PiSockSessionEnded, match="interrupted.*Operation aborted"):
+        _dict_response(handle, content, session)
+    assert not prompts
+
+
+def test_aborted_session_file_overrides_cached_success_metadata(tmp_path):
+    import json
+    from pi_subagents.client import PiSockSessionEnded
+    handle, session, prompts, _ = fake_handle([])
+    session_file = tmp_path / "aborted.jsonl"
+    session_file.write_text(json.dumps({
+        "type": "message", "message": {
+            "role": "assistant", "content": [], "stopReason": "aborted",
+        },
+    }) + "\n")
+    session.session_file = str(session_file)
+    handle.settled_data["lastAssistant"]["stopReason"] = "stop"
+    with pytest.raises(PiSockSessionEnded, match="interrupted"):
+        _dict_response(handle, "partial", session)
+    assert not prompts
+
+
+def test_aborted_repair_reply_does_not_trigger_another_followup(monkeypatch):
+    from pi_subagents.client import PiSockSessionEnded
+    monkeypatch.setenv("PI_SUBAGENTS_SCHEMA_RETRIES", "3")
+    handle, session, prompts, _ = fake_handle([
+        {"content": "partial repair", "stopReason": "aborted"},
+    ])
+    with pytest.raises(PiSockSessionEnded, match="interrupted"):
+        _dict_response(handle, "bad initial", session)
+    assert len(prompts) == 1
+
+
+def test_local_abort_during_validation_prevents_followup(monkeypatch):
+    from pi_subagents.client import PiSockSessionEnded
+    from pi_subagents import handle as handle_mod
+    handle, session, prompts, _ = fake_handle([])
+    def interrupted_validation(schema, value):
+        handle.closed = True
+        raise SchemaValidationError("invalid summary")
+    monkeypatch.setattr(handle_mod, "validate_with_schema", interrupted_validation)
+    with pytest.raises(PiSockSessionEnded, match="schema repair stopped"):
+        _dict_response(handle, '{"summary": 7}', session)
+    assert not prompts
+
+
+def test_local_abort_while_waiting_for_repair_stops_wait_immediately():
+    from pi_subagents.client import PiSockSessionEnded
+    handle, session, prompts, _ = fake_handle([])
+    def interrupted_wait(timeout, after_message=None, on_tick=None):
+        handle.closed = True
+        on_tick({"isIdle": True})
+        raise AssertionError("interrupt must stop the wait")
+    handle._sync.wait_settled = interrupted_wait
+    with pytest.raises(PiSockSessionEnded, match="schema repair stopped"):
+        _dict_response(handle, "bad initial", session)
+    assert len(prompts) == 1
+
+
+def test_provider_failure_is_not_a_schema_repair_case():
+    from pi_subagents.client import PiSockTurnFailed
+    handle, session, prompts, _ = fake_handle([])
+    handle.settled_data["lastAssistant"].update(
+        stopReason="error", errorMessage="quota exhausted",
+    )
+    with pytest.raises(PiSockTurnFailed, match="quota exhausted"):
+        _dict_response(handle, "", session)
+    assert not prompts
+
+
+@pytest.mark.parametrize("state", [
+    {"isIdle": False},
+    {"isIdle": True, "hasPendingMessages": True},
+])
+def test_schema_repair_allows_provider_retry_while_work_is_pending(tmp_path, state):
+    import json
+    handle, session, prompts, _ = fake_handle([])
+    session_file = tmp_path / "provider-retry.jsonl"
+    session.session_file = str(session_file)
+    def wait_during_retry(timeout, after_message=None, on_tick=None):
+        def record(stop):
+            session_file.write_text(json.dumps({
+                "type": "message", "message": {"role": "assistant", "stopReason": stop},
+            }) + "\n")
+        record("error")
+        on_tick(state)
+        record("stop")
+        return {"lastAssistant": {"content": '{"summary": "recovered"}', "timestamp": 1}}
+    handle._sync.wait_settled = wait_during_retry
+    assert _dict_response(handle, "bad initial", session) == {"summary": "recovered"}
+    assert len(prompts) == 1

@@ -91,18 +91,23 @@ def _last_assistant_outcome(session_file: str | None) -> tuple[str, str | None] 
 	return None
 
 
-def raise_for_failed_outcome(session_file: str | None) -> None:
+def raise_for_failed_outcome(session_file: str | None, *, last_message: dict | None = None) -> None:
 	"""Raise when the session's last assistant entry ended abnormally.
 
 	- stopReason "aborted": the user interrupted the turn.
 	- Any other non-success terminal reason ("error", ...): the run failed at
 	  the provider — quota exhausted, rate limit, API error.
 
+	Use wire-message metadata as a fallback when the session file is unavailable.
 	Both bubble immediately as errors instead of settling cleanly, so a
 	workflow cannot silently drain on a dead agent. "stop", "toolUse",
 	"length", "pending" and "deferred" are treated as successful settles.
 	"""
 	outcome = _last_assistant_outcome(session_file)
+	if outcome is None and isinstance(last_message, dict):
+		stop = last_message.get("stopReason")
+		if isinstance(stop, str):
+			outcome = (stop, last_message.get("errorMessage"))
 	if outcome is None:
 		return
 	stop, error_message = outcome

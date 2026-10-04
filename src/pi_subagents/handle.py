@@ -15,7 +15,10 @@ import os
 import time
 from typing import Any
 
-from .client import AsyncSockClient, PiSockError, PiSockUnavailable, SockClient
+from .client import (
+	AsyncSockClient, PiSockError, PiSockSessionEnded, PiSockUnavailable, SockClient,
+	raise_for_failed_outcome,
+)
 from .errors import PiSubagentsError, PiSubagentsTimeoutError
 from .envcheck import require_environment
 from .registry import REGISTRY
@@ -614,9 +617,22 @@ class AgentHandle:
 		return self._session
 
 
+def _raise_for_failed_schema_turn(handle: AgentHandle, session, *, check_outcome: bool = True) -> None:
+	# abort() closes the handle before the aborted session entry is necessarily
+	# visible. Never revive that run by sending an automatic repair prompt.
+	if getattr(handle, "closed", False):
+		raise PiSockSessionEnded(f"subagent {handle.name}: interrupted or closed; schema repair stopped")
+	if check_outcome:
+		raise_for_failed_outcome(
+			getattr(session, "session_file", None),
+			last_message=(handle.settled_data or {}).get("lastAssistant"),
+		)
+
+
 def _dict_response(handle: AgentHandle, text: str, session) -> "AgentDictResponse":
 	retries = _schema_retries()
 	for attempt in range(retries + 1):
+		_raise_for_failed_schema_turn(handle, session)
 		parsed, error = _parse_json(text)
 		if error is None:
 			try:
@@ -631,8 +647,16 @@ def _dict_response(handle: AgentHandle, text: str, session) -> "AgentDictRespons
 		# Require a newer assistant message; an idle socket may still expose the
 		# rejected reply briefly after the repair prompt has been accepted.
 		baseline = (handle.settled_data or {}).get("lastAssistant")
+		_raise_for_failed_schema_turn(handle, session)
 		handle.send(_schema_retry_prompt(handle.schema, error), mode="follow_up")
-		settle = handle._sync.wait_settled(_settle_timeout_default(), after_message=baseline)
+		settle = handle._sync.wait_settled(
+			_settle_timeout_default(), after_message=baseline,
+			on_tick=lambda state: _raise_for_failed_schema_turn(
+				handle, session,
+				# pi can retry provider failures internally while still running.
+				check_outcome=bool(state.get("isIdle") and not state.get("hasPendingMessages")),
+			),
+		)
 		if settle is None:
 			raise PiSubagentsTimeoutError(f"subagent {handle.name}: schema repair timed out")
 		handle.settled_data = settle

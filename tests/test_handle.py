@@ -349,3 +349,32 @@ def test_startup_failure_marks_the_handle_failed(tmp_path, monkeypatch):
 	assert h._startup_error is not None
 	with pytest.raises(PiSubagentsError, match="startup failed"):
 		h.wait(timeout=1)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_abort_during_schema_parse_never_sends_repair(tmp_path, monkeypatch, asynchronous):
+    from asyncio import Runner
+    from pi_subagents.client import PiSockSessionEnded
+    h = AgentHandle("p", name="schema-abort", cwd=str(tmp_path), window_name="schema-abort",
+                    model=None, thinking=None, schema={"type": "object"})
+    server = bind_handle(h, tmp_path)
+    server.behaviors["state"] = {"isIdle": True, "hasPendingMessages": False}
+    server.behaviors["message"] = {"content": "partial output", "timestamp": 1}
+    original_parse = handle_mod._parse_json
+    def parse_then_interrupt(text):
+        h.abort()
+        return original_parse(text)
+    def unexpected_followup(*args, **kwargs):
+        pytest.fail("an interrupted handle must not receive a JSON repair prompt")
+    monkeypatch.setattr(handle_mod, "_parse_json", parse_then_interrupt)
+    monkeypatch.setattr(h, "send", unexpected_followup)
+    try:
+        with pytest.raises(PiSockSessionEnded, match="schema repair stopped"):
+            if asynchronous:
+                with Runner() as runner:
+                    runner.run(h.wait_async(timeout=5))
+            else:
+                h.wait(timeout=5)
+        assert h.closed
+    finally:
+        server.close()

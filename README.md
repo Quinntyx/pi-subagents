@@ -110,8 +110,10 @@ notebook cell. Catch expected failures around individual agents/completions;
 avoid a blanket handler around the entire workflow.
 
 Invalid schema output is parsed/validated internally and repaired using the
-actual error in up to three follow-up prompts. Exhaustion raises
-`SchemaValidationError`; a repair timeout raises `PiSubagentsTimeoutError`.
+actual error in up to three follow-up prompts. Aborted turns and terminal
+provider failures stop schema repair instead of requesting another JSON reply.
+Exhaustion raises `SchemaValidationError`; a repair timeout raises
+`PiSubagentsTimeoutError`.
 The library never returns an invalid/raw JSON envelope as a successful schema
 body. Pop timeouts raise `AgentPoolTimeoutError` with a pool snapshot. Explicit
 cancellation is a separate `cancelled` outcome, not a successful response.
