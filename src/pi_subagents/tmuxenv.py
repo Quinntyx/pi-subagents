@@ -9,11 +9,13 @@ import shlex
 import shutil
 # Keep the established process-boundary alias used by external wrappers.
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .envcheck import require_environment, tmux
+from .recursion import RootBudget, ensure_can_spawn
 
 SOCK_DIR = Path.home() / ".pi" / "pi-sock"
 PROFILES_ROOT = Path.home() / ".config" / "pi" / "profiles"
@@ -113,6 +115,9 @@ def spawn_pi_window(
 	the pi-profiles root, or a path used verbatim; None → PI_CODING_SUBAGENT_DIR
 	or the parent's own agent dir.
 	"""
+	child_depth = ensure_can_spawn()
+	if type(depth) is not int or depth != child_depth:
+		raise ValueError("subagent depth must equal the policy-approved child depth")
 	placement = require_environment()
 	sock_path = socket_dir() / f"{socket_name}.sock"
 	agent_dir_resolved = resolve_agent_dir(agentDir)
@@ -152,12 +157,83 @@ def spawn_pi_window(
 	primary = os.environ.get("PI_PTC_PRIMARY")
 	if primary:
 		args += ["-e", f"PI_PTC_PRIMARY={primary}"]
-	args.append(pi_cmd)
+	budget = RootBudget.for_environment()
+	token = budget.reserve(socket_name, child_depth) if budget is not None else None
+	window_id = None
+	attempted = False
+	# A unique marker in pane_start_command lets failed new-window calls be
+	# reconciled without assuming an exception means no window was created.
+	marker = f"PI_SUBAGENTS_WINDOW_OWNER={token}"
+	try:
+		if budget is not None:
+			child_environment = {**runtime_child_env(), **budget.child_env(token)}
+			for key, value in child_environment.items():
+				args += ["-e", f"{key}={value}"]
+			pi_cmd = f"exec env {shlex.quote(marker)} {pi_cmd}"
+		args.append(pi_cmd)
+		attempted = True
+		window_id = tmux(*args).strip()
+		if not re.fullmatch(r"@[0-9]+", window_id):
+			raise RuntimeError(f"tmux new-window returned invalid window id: {window_id!r}")
+		if budget is not None:
+			budget.attach(token, window_id)
+		return WindowRef(window_id=window_id, socket_path=str(sock_path), name=name,
+		                 budget=budget, admission_token=token)
+	except BaseException:
+		if budget is not None:
+			confirmed = not attempted
+			if attempted:
+				confirmed = _cleanup_failed_spawn(marker, window_id, placement.window_id)
+			if confirmed:
+				budget.release(token)
+		raise
 
-	window_id = tmux(*args).strip()
-	if not window_id:
-		raise RuntimeError("tmux new-window returned no window id")
-	return WindowRef(window_id=window_id, socket_path=str(sock_path), name=name)
+
+def runtime_child_env() -> dict[str, str]:
+	"""Pin children to the interpreter and source actually imported here.
+
+	Do not trust a stale PTC_SUBAGENTS_SOURCE or tmux's server environment.
+	Preserve the venv executable's symlink (resolving it loses the venv).
+	"""
+	package_parent = Path(__file__).resolve().parent.parent
+	source = package_parent.parent if package_parent.name == "src" else package_parent
+	pythonpath = str(package_parent)
+	if os.environ.get("PYTHONPATH"):
+		pythonpath += os.pathsep + os.environ["PYTHONPATH"]
+	env = {
+		"PTC_PYTHON_EXECUTABLE": os.path.abspath(sys.executable),
+		"PTC_SUBAGENTS_SOURCE": str(source),
+		"PYTHONPATH": pythonpath,
+	}
+	for key in ("PI_SOCK_DIR", "PI_CODING_SUBAGENT_DIR"):
+		if key in os.environ:
+			env[key] = os.environ[key]
+	return env
+
+
+def _cleanup_failed_spawn(marker: str, window_id: str | None, caller_window: str) -> bool:
+	"""Release admission only after an authoritative owned-window reconciliation."""
+	try:
+		rows = tmux("list-panes", "-a", "-F", "#{window_id}\t#{pane_start_command}")
+		owned = set()
+		for row in rows.splitlines():
+			wid, _, command = row.partition("\t")
+			if marker in shlex.split(command):
+				owned.add(wid)
+		if window_id and re.fullmatch(r"@[0-9]+", window_id):
+			# Never kill a returned ID whose ownership cannot be reconciled.
+			listed = {row.partition("\t")[0] for row in rows.splitlines()}
+			if window_id in listed and window_id not in owned:
+				return False
+		for wid in owned:
+			if wid == caller_window:
+				return False
+			kill_window(wid)
+			if not window_absent(wid):
+				return False
+		return True
+	except Exception:
+		return False
 
 
 def subagent_session_name(name: str) -> str:
@@ -208,17 +284,33 @@ def _quote_for_tmux_shell(text: str) -> str:
 	return shlex.quote(text)
 
 
-def window_alive(window_id: str) -> bool:
+def window_absent(window_id: str) -> bool:
+	"""True only when tmux authoritatively reports an exact window ID absent."""
+	if not re.fullmatch(r"@[0-9]+", window_id):
+		return False
 	try:
 		windows = tmux("list-windows", "-a", "-F", "#{window_id}").splitlines()
 	except Exception:
 		return False
+	return window_id not in windows
+
+
+def window_alive(window_id: str) -> bool:
+	try:
+		windows = tmux("list-windows", "-a", "-F", "#{window_id}").splitlines()
+	except Exception:
+		# Unknown is not confirmed gone: admission must remain charged.
+		return True
 	return window_id in windows
 
 
 def kill_window(window_id: str) -> bool:
-	"""Best-effort cleanup, with an acknowledgement for conservative hibernation."""
+	"""Kill an exact window ID, never a caller window or a tmux target expression."""
 	try:
+		if not re.fullmatch(r"@[0-9]+", window_id):
+			return False
+		if window_id == require_environment().window_id:
+			return False
 		tmux("kill-window", "-t", window_id)
 	except Exception:
 		return False
@@ -231,3 +323,5 @@ class WindowRef:
 	socket_path: str
 	name: str
 	created_at: float = field(default_factory=time.time)
+	budget: RootBudget | None = field(default=None, repr=False)
+	admission_token: str | None = field(default=None, repr=False)

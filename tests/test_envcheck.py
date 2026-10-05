@@ -17,6 +17,7 @@ def reset_env(monkeypatch):
 	monkeypatch.delenv("TMUX", raising=False)
 	monkeypatch.delenv("TMUX_PANE", raising=False)
 	monkeypatch.delenv("PI_SUBAGENT_DEPTH", raising=False)
+	monkeypatch.delenv("PI_SUBAGENTS_MAX_DEPTH", raising=False)
 	envcheck.placement = None
 	envcheck.ENV_OK = False
 	envcheck.WARNING_SHOWN = False
@@ -41,10 +42,44 @@ def _noop():
 	return nullcontext()
 
 
-def test_depth_lock_raises_not_implemented(reset_env, monkeypatch):
+@pytest.mark.parametrize("depth", ["1", "2"])
+def test_import_probe_is_legal_at_spawn_boundary(reset_env, monkeypatch, depth):
+	monkeypatch.setenv("PI_SUBAGENT_DEPTH", depth)
+	envcheck.ensure_environment()
+	assert envcheck.ENV_OK is False
+
+
+def test_flat_policy_rejects_child_spawn(reset_env, monkeypatch):
+	from pi_subagents.recursion import ensure_can_spawn
+
+	assert ensure_can_spawn() == 1
 	monkeypatch.setenv("PI_SUBAGENT_DEPTH", "1")
-	with pytest.raises(NotImplementedError, match="PI_SUBAGENT_DEPTH"):
-		envcheck.ensure_environment()
+	with pytest.raises(Exception, match="depth|Depth|spawn"):
+		ensure_can_spawn()
+
+
+def test_recursive_policy_returns_child_depth(reset_env, monkeypatch):
+	from pi_subagents.recursion import ensure_can_spawn
+
+	monkeypatch.setenv("PI_SUBAGENTS_MAX_DEPTH", "2")
+	monkeypatch.setenv("PI_SUBAGENT_DEPTH", "1")
+	assert ensure_can_spawn() == 2
+	monkeypatch.setenv("PI_SUBAGENT_DEPTH", "2")
+	with pytest.raises(Exception, match="depth|Depth|spawn"):
+		ensure_can_spawn()
+
+
+@pytest.mark.parametrize("key,value", [
+	("PI_SUBAGENT_DEPTH", "-1"), ("PI_SUBAGENT_DEPTH", "bogus"),
+	("PI_SUBAGENT_DEPTH", "1.0"), ("PI_SUBAGENTS_MAX_DEPTH", "0"),
+	("PI_SUBAGENTS_MAX_DEPTH", "-2"), ("PI_SUBAGENTS_MAX_DEPTH", "bad"),
+])
+def test_spawn_policy_rejects_malformed_limits(reset_env, monkeypatch, key, value):
+	from pi_subagents.recursion import ensure_can_spawn
+
+	monkeypatch.setenv(key, value)
+	with pytest.raises(Exception):
+		ensure_can_spawn()
 
 
 def test_require_environment_raises_without_tmux(reset_env):

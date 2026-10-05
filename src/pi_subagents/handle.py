@@ -12,6 +12,7 @@ import concurrent.futures
 import threading
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -22,10 +23,12 @@ from .client import (
 from .errors import PiSubagentsError, PiSubagentsTimeoutError
 from .envcheck import require_environment
 from .registry import REGISTRY
+from .recursion import current_depth, ensure_can_spawn
 from .response import AgentDictResponse, AgentStrResponse
 from .schema import SchemaValidationError, validate_schema, validate_with_schema
 from .tmuxenv import (
 	kill_window, resolve_agent_dir, spawn_pi_window, unique_socket_name, window_alive,
+	window_absent,
 )
 
 DEFAULT_SETTLE_TIMEOUT = 30 * 60.0
@@ -54,8 +57,9 @@ def unload_window(window_id: str) -> bool:
 	Keep kill_window as the underlying boundary for existing wrappers, including
 	older wrappers returning None; the built-in reports explicit command failure.
 	"""
-	killed = kill_window(window_id)
-	return killed is not False and not window_alive(window_id)
+	kill_window(window_id)
+	# Only authoritative absence releases admission, not a failed liveness probe.
+	return window_absent(window_id)
 
 
 class AgentHandle:
@@ -109,7 +113,11 @@ class AgentHandle:
 		self._cached_state: dict = {}
 		self._cached_activity: dict | None = None
 		self._agent_dir: str | os.PathLike[str] | None = None
-		self._depth = int(os.environ.get("PI_SUBAGENT_DEPTH", "0") or 0) + 1
+		self._depth = current_depth() + 1
+		self._budget = None
+		self._admission_token: str | None = None
+		self._lifecycle_lock = threading.RLock()
+		self._cleanup_error: str | None = None
 		# Latest pi-activity API snapshot (filled by activity polling).
 		self.phase: str | None = None
 		self.label: str | None = None
@@ -140,6 +148,8 @@ class AgentHandle:
 		self._async = AsyncSockClient(f"<unbound:{self.id}>")
 
 	def _bind(self, window_ref) -> None:
+		self._budget = getattr(window_ref, "budget", None)
+		self._admission_token = getattr(window_ref, "admission_token", None)
 		self.window_id = window_ref.window_id
 		self.socket_path = window_ref.socket_path
 		self._sync = SockClient(window_ref.socket_path)
@@ -149,12 +159,24 @@ class AgentHandle:
 
 	# -- startup: readiness + first prompt over pi-sock -------------------------
 
+	def _bounded_timeout(self, timeout: float) -> float:
+		"""Root deadline bounds existing work as well as new window admissions."""
+		if self._budget is None:
+			return timeout
+		remaining = self._budget.remaining_seconds()
+		if remaining <= 0:
+			raise PiSubagentsTimeoutError(f"subagent {self.name}: root deadline exceeded")
+		# Bound socket round trips inside readiness/settlement polling as well.
+		for client in (self._sync, self._async):
+			client.timeout = min(client.timeout, remaining)
+		return min(timeout, remaining)
+
 	def _await_ready(self, timeout: float | None = None) -> None:
 		"""Block until the initial prompt has been delivered (or startup failed)."""
 		if not self._startup_started:
 			return
 		try:
-			self._ready.result(timeout=timeout if timeout is not None else _startup_timeout() + 5.0)
+			self._ready.result(timeout=self._bounded_timeout(timeout if timeout is not None else _startup_timeout() + 5.0))
 		except Exception as error:  # concurrent.futures.TimeoutError
 			raise PiSubagentsError(
 				f"subagent {self.name}: the initial prompt was not delivered within "
@@ -172,7 +194,7 @@ class AgentHandle:
 			return
 		await asyncio.wait_for(
 			asyncio.shield(asyncio.wrap_future(self._ready)),
-			timeout=timeout if timeout is not None else _startup_timeout() + 5.0,
+			timeout=self._bounded_timeout(timeout if timeout is not None else _startup_timeout() + 5.0),
 		)
 		if self._startup_error is not None:
 			raise PiSubagentsError(
@@ -187,10 +209,13 @@ class AgentHandle:
 		initial prompt. Startup failures retain their windows for inspection.
 		"""
 		try:
-			deadline = time.monotonic() + _startup_timeout()
+			deadline = time.monotonic() + self._bounded_timeout(_startup_timeout())
 			while True:
 				if self._killed:
 					return
+				self._bounded_timeout(max(0.0, deadline - time.monotonic()))
+				if time.monotonic() >= deadline:
+					raise TimeoutError("startup deadline exceeded before pi-sock readiness")
 				try:
 					self._remember_state(self._sync.state())
 					break  # pi-sock answers: session started, UI is coming up
@@ -203,6 +228,7 @@ class AgentHandle:
 			if self._killed:
 				return
 			# pi is idle here, so a plain send triggers the first turn immediately.
+			self._bounded_timeout(_startup_timeout())
 			self._sync.send(self.prompt, mode="steer")
 			self.status = "running"
 		except Exception as error:
@@ -264,6 +290,7 @@ class AgentHandle:
 			"sessionFile": self.session_file,
 			"sessionId": self.session_id,
 			"dormant": self._dormant,
+			"cleanupError": self._cleanup_error,
 			"lastOutcome": self.last_outcome,
 			"toolCalls": self.tool_calls,
 			"thinkingMs": self.thinking_ms,
@@ -278,7 +305,7 @@ class AgentHandle:
 				"limit": self.ctx_limit,
 				"percent": self.ctx_percent,
 			} if self.ctx_tokens is not None else None,
-			"depth": int(os.environ.get("PI_SUBAGENTS_MAX_DEPTH", "0") or 0) or None,
+			"depth": self._depth,
 		}
 
 	# -- control ------------------------------------------------------------
@@ -293,7 +320,8 @@ class AgentHandle:
 		return await self._async.send(text, mode)
 
 	def abort(self) -> dict:
-		"""Stop the current run. The handle closes; resume with resume_async."""
+		"""Stop the turn and owned descendants, retaining this window for inspection."""
+		self._terminate_descendants()
 		try:
 			result = self._sync.abort()
 		except PiSockUnavailable:
@@ -306,6 +334,7 @@ class AgentHandle:
 		return result
 
 	async def abort_async(self) -> dict:
+		await asyncio.to_thread(self._terminate_descendants)
 		try:
 			result = await self._async.abort()
 		except PiSockUnavailable:
@@ -328,7 +357,7 @@ class AgentHandle:
 		# for an otherwise live session. Never respawn it: retry normal control
 		# only when the scheduler has admitted this explicitly requested turn.
 		if self._startup_started:
-			self._ready.result(timeout=_startup_timeout() + 5)
+			self._ready.result(timeout=self._bounded_timeout(_startup_timeout() + 5))
 		self._startup_error = None
 		self._await_ready()
 		self._capture_outcome_baseline()
@@ -386,12 +415,15 @@ class AgentHandle:
 	def _reopen(self, prompt: str) -> "AgentHandle":
 		if not self.session_file or not os.path.isfile(self.session_file):
 			raise PiSubagentsError(f"subagent {self.name}: durable session file is unavailable")
+		depth = ensure_can_spawn()
+		if self._admission_token is not None:
+			raise PiSubagentsError("cannot reopen while the previous window owns admission")
 		baseline = (self.settled_data or {}).get("lastAssistant")
 		window_ref = spawn_pi_window(
 			prompt, name=self.name, cwd=self.cwd, window_name=self.window_name,
 			model=self._cached_state.get("model") or self.model,
 			thinking=self._cached_state.get("thinkingLevel") or self.thinking,
-			socket_name=unique_socket_name(self.name), depth=self._depth,
+			socket_name=unique_socket_name(self.name), depth=depth,
 			agentDir=self._agent_dir, session_file=self.session_file,
 		)
 		self.prompt = prompt
@@ -401,10 +433,15 @@ class AgentHandle:
 		self._ready = concurrent.futures.Future()
 		self._startup_error = None
 		self._killed = False
-		self._bind(window_ref)
-		self._capture_outcome_baseline()
-		self._startup_started = True
-		threading.Thread(target=self._run_startup, name=f"subagent-startup-{self.id}", daemon=True).start()
+		self._depth = depth
+		try:
+			self._bind(window_ref)
+			self._capture_outcome_baseline()
+			self._startup_started = True
+			threading.Thread(target=self._run_startup, name=f"subagent-startup-{self.id}", daemon=True).start()
+		except BaseException:
+			self.kill()
+			raise
 		return self
 
 	@property
@@ -430,13 +467,84 @@ class AgentHandle:
 			self.session._load()
 			if not self.window_id:
 				return False
-			if not unload_window(self.window_id):
+			if not self._unload_owned_tree():
+				self._cleanup_failed("successful task retained its window: recursive cleanup unconfirmed")
+				REGISTRY.emit()
 				return False
-		except Exception:
-			# Inspection/cleanup failures never turn a successful task into a failure.
+		except Exception as error:
+			# Preserve success, but expose the retained-window cleanup diagnostic.
+			self._cleanup_failed(f"successful task retained its window: {error}")
+			REGISTRY.emit()
 			return False
+		if self._cleanup_error is not None:
+			self.phase = self.label = None
+		self._cleanup_error = None
 		self._dormant = True
 		return True
+
+	def _cleanup_failed(self, message: str) -> None:
+		self._cleanup_error = message
+		self.phase = "cleanup"
+		self.label = message
+
+	def _terminate_descendants(self) -> bool:
+		"""Unload only the broker-proven subtree, deepest first.
+
+		Pending reservations cannot be reclaimed: a launcher may still be creating
+		their windows. Failed cleanup keeps the ancestor and its permit charged.
+		"""
+		with self._lifecycle_lock:
+			if self._budget is None or self._admission_token is None:
+				return True
+			try:
+				# Atomically reject later reserve/attach before enumerating this tree.
+				self._budget.begin_close(self._admission_token)
+				records = self._budget.descendants(self._admission_token)
+				depths = {self._admission_token: self._depth}
+				for record in reversed(records):
+					parent_depth = depths.get(record["parent_token"])
+					if parent_depth is None or record["depth"] != parent_depth + 1:
+						return False
+					depths[record["token"]] = record["depth"]
+				caller_window = require_environment().window_id
+				for record in records:
+					wid = record["window_id"]
+					if not isinstance(wid, str) or not re.fullmatch(r"@[0-9]+", wid) or wid in (self.window_id, caller_window):
+						return False
+					if not unload_window(wid):
+						return False
+					self._budget.release(record["token"])
+				# Catch reservations admitted during cleanup; never release their
+				# ancestor while an owned descendant still exists.
+				return not self._budget.descendants(self._admission_token)
+			except Exception:
+				return False
+
+	def _unload_owned_tree(self) -> bool:
+		with self._lifecycle_lock:
+			if self._budget is not None and self._admission_token is not None:
+				try:
+					if not self.window_id or not re.fullmatch(r"@[0-9]+", self.window_id):
+						return False
+					if self.window_id == require_environment().window_id:
+						return False
+				except Exception:
+					return False
+			if not self._terminate_descendants():
+				return False
+			if self.window_id and not unload_window(self.window_id):
+				return False
+			if self._budget is not None and self._admission_token is not None:
+				try:
+					# Recheck after parent termination: a concurrently admitted child
+					# still owns its permit and needs an explicit later cleanup.
+					if not self._terminate_descendants():
+						return False
+					self._budget.release(self._admission_token)
+				except Exception:
+					return False
+				self._admission_token = None
+			return True
 
 	def set_session_name(self, name: str) -> dict:
 		"""Rename the live pi session; pi updates its terminal title immediately."""
@@ -456,12 +564,18 @@ class AgentHandle:
 			self.abort()
 		except Exception:
 			pass
-		if self.window_id:
-			kill_window(self.window_id)
-		self.status = "dead"
+		unloaded = self._unload_owned_tree()
+		self.closed = True
+		if unloaded:
+			if self._cleanup_error is not None:
+				self.phase = self.label = None
+			self._cleanup_error = None
+		else:
+			self._cleanup_failed("window cleanup unconfirmed; admission retained (retry kill to clean up)")
+		self.status = "dead" if unloaded else "failed"
 		self._stamp_runtime()
 		try:
-			if self.socket_path and os.path.exists(self.socket_path):
+			if unloaded and self.socket_path and os.path.exists(self.socket_path):
 				os.unlink(self.socket_path)
 		except OSError:
 			pass
@@ -564,7 +678,7 @@ class AgentHandle:
 		revision = self._settlement_revision
 		try:
 			settle = self._sync.wait_settled(
-				timeout if timeout is not None else _settle_timeout_default(),
+				self._bounded_timeout(timeout if timeout is not None else _settle_timeout_default()),
 				poll=poll,
 				on_tick=self._tick_sync,
 				after_message=self._wait_baseline,
@@ -597,7 +711,7 @@ class AgentHandle:
 		revision = self._settlement_revision
 		try:
 			settle = await self._async.wait_settled(
-				timeout if timeout is not None else _settle_timeout_default(),
+				self._bounded_timeout(timeout if timeout is not None else _settle_timeout_default()),
 				poll=poll,
 				on_tick=self._tick_async,
 				after_message=self._wait_baseline,
@@ -630,7 +744,7 @@ class AgentHandle:
 		return self.wait_async().__await__()
 
 	def _await_socket(self, path: str | None, timeout: float | None) -> bool:
-		deadline = (time.monotonic() + (timeout or 60.0)) if timeout is not None else time.monotonic() + 60.0
+		deadline = time.monotonic() + self._bounded_timeout(timeout if timeout is not None else 60.0)
 		while time.monotonic() < deadline:
 			if path and os.path.exists(path):
 				try:
@@ -644,7 +758,7 @@ class AgentHandle:
 		return False
 
 	async def _await_socket_async(self, timeout: float | None = None) -> bool:
-		deadline = time.monotonic() + (timeout or 60.0)
+		deadline = time.monotonic() + self._bounded_timeout(timeout if timeout is not None else 60.0)
 		while time.monotonic() < deadline:
 			if self.socket_path and os.path.exists(self.socket_path):
 				try:
@@ -790,7 +904,7 @@ def _dict_response(handle: AgentHandle, text: str, session) -> "AgentDictRespons
 			capture()
 		handle.send(_schema_retry_prompt(handle.schema, error), mode="follow_up")
 		settle = handle._sync.wait_settled(
-			_settle_timeout_default(), after_message=baseline,
+			handle._bounded_timeout(_settle_timeout_default()), after_message=baseline,
 			on_tick=lambda state: _raise_for_failed_schema_turn(
 				handle, session,
 				# pi can retry provider failures internally while still running.
@@ -871,7 +985,7 @@ def spawn_pi_window_handle(
 	register: bool = True,
 ) -> AgentHandle:
 	"""Spawn one live pi session for the pool scheduler."""
-	depth = int(os.environ.get("PI_SUBAGENT_DEPTH", "0") or 0) + 1
+	depth = ensure_can_spawn()
 	handle = AgentHandle(
 		prompt,
 		name=name or "subagent",
@@ -896,11 +1010,15 @@ def spawn_pi_window_handle(
 		session_name=session_name,
 	)
 	handle.group = group
-	handle._bind(window_ref)
-	if register:
-		REGISTRY.register(handle)
-	# Deliver the initial prompt over pi-sock once the instance is ready.
-	handle._startup_started = True
-	threading.Thread(target=handle._run_startup, name=f"subagent-startup-{handle.id}", daemon=True).start()
-	REGISTRY.emit()
+	try:
+		handle._bind(window_ref)
+		if register:
+			REGISTRY.register(handle)
+		# Deliver the initial prompt over pi-sock once the instance is ready.
+		handle._startup_started = True
+		threading.Thread(target=handle._run_startup, name=f"subagent-startup-{handle.id}", daemon=True).start()
+		REGISTRY.emit()
+	except BaseException:
+		handle.kill()
+		raise
 	return handle

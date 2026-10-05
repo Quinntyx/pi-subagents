@@ -227,6 +227,7 @@ def test_pool_close_kills_windows_and_prunes_sockets(tmp_path, monkeypatch):
 	killed = []
 	monkeypatch.setattr(handle_mod, "kill_window", lambda window_id: killed.append(window_id))
 	monkeypatch.setattr(handle_mod, "window_alive", lambda window_id: False)
+	monkeypatch.setattr(handle_mod, "window_absent", lambda window_id: True)
 
 	servers = []
 

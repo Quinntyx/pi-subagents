@@ -2,9 +2,7 @@
 
 Runs at ``import pi_subagents``. The contract:
 
-1. ``PI_SUBAGENT_DEPTH`` is set → raise ``NotImplementedError`` (spawned agents
-   cannot spawn agents; the orchestration tree stays height 2 until the
-   PI_PTC_PRIMARY reporting mesh exists).
+1. Import is legal at every depth; spawn policy is checked when creating windows.
 2. ``$TMUX`` is missing or the tmux server is unreachable → warn once, set
    ``ENV_OK = False``; every API call then raises ``NotImplementedError``.
 3. Otherwise capture the current tmux session so spawned windows land next to
@@ -29,11 +27,6 @@ TMUX_UNREACHABLE = (
 	"({detail}). Subagent spawning is nonfunctional here — any call to the "
 	"subagent API will raise NotImplementedError. The rest of this script "
 	"still runs."
-)
-DEPTH_LOCKED = (
-	"pi_subagents: subagent spawning is disabled in this environment "
-	"(PI_SUBAGENT_DEPTH={depth} is set — spawned agents cannot spawn further "
-	"agents). Use provision_python_session/python_exec for computation instead."
 )
 
 
@@ -68,16 +61,7 @@ placement: TmuxPlacement | None = None
 
 
 def ensure_environment() -> None:
-	"""Idempotent import-time probe. Raises NotImplementedError on depth lock."""
-	depth = os.environ.get("PI_SUBAGENT_DEPTH", "")
-	if depth not in ("", "0"):
-		try:
-			parsed = int(depth)
-		except ValueError:
-			parsed = 1
-		if parsed > 0:
-			raise NotImplementedError(DEPTH_LOCKED.format(depth=depth))
-
+	"""Idempotent import-time tmux probe; never prohibits nested imports."""
 	global placement, ENV_OK
 	if placement is not None:
 		ENV_OK = True

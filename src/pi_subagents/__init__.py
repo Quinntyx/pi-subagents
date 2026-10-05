@@ -17,8 +17,10 @@ The public orchestration API is the AgentPool:
 
 Environment contract (checked at import):
 
-- ``PI_SUBAGENT_DEPTH`` set → ``import pi_subagents`` raises ``NotImplementedError``.
-  Spawned agents cannot spawn further agents; the orchestration tree stays height 2.
+- Imports are legal at every depth. Spawning is flat by default; recursion is
+  opt-in via ``PI_SUBAGENTS_MAX_DEPTH > 1`` and bounded by a shared root budget.
+  ``PI_SUBAGENTS_ROOT_MAX_TASKS`` counts admitted window creations, including
+  reopens; retained failure windows remain charged until confirmed cleanup.
 - Not inside tmux (``$TMUX`` missing/unreachable) → the module imports with a
   warning; every API call raises ``NotImplementedError``.
 """
@@ -88,14 +90,12 @@ __version__ = "0.2.0"
 
 
 def _depth() -> int:
-	try:
-		return int(__import__("os").environ.get("PI_SUBAGENT_DEPTH", "0"))
-	except ValueError:
-		return 0
+	from .recursion import current_depth
+
+	return current_depth()
 
 
-# Runs at import: raises NotImplementedError when PI_SUBAGENT_DEPTH is set,
-# warns when tmux is absent, and otherwise captures the tmux placement context.
+# Warn when tmux is absent; capture placement without imposing spawn policy.
 ensure_environment()
 
 
