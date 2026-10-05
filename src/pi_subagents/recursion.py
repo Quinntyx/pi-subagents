@@ -289,6 +289,8 @@ class RootBudget:
                     state = json.load(stream, object_pairs_hook=_unique_object)
                 except (ValueError, UnicodeError, RecursionError) as error:
                     raise RootBudgetError("malformed root admission state") from error
+            if not isinstance(state, dict):
+                raise RootBudgetError("malformed root admission state: expected an object")
             yield state
             if create and os.fstat(fd).st_size == 0:
                 os.write(fd, b"initialized\n")

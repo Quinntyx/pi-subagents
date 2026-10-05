@@ -105,6 +105,23 @@ def test_recursive_spawn_attaches_and_explicitly_pins_runtime(setup, tmp_path, m
     assert setup.events == [("reserve", "worker", 1), ("attach", "owned-token", "@2")]
 
 
+def test_flat_children_reuse_runtime_without_recursive_admission(setup, tmp_path, monkeypatch):
+    args = []
+    monkeypatch.setattr(tmuxenv.RootBudget, "for_environment", lambda: None)
+    monkeypatch.setenv("PI_SUBAGENTS_MAX_DEPTH", "1")
+    monkeypatch.setenv("PI_SUBAGENTS_MAX_CONCURRENT", "3")
+    monkeypatch.setattr(tmuxenv, "tmux", lambda *tokens: args.extend(tokens) or "@2")
+    ref = spawn(tmp_path)
+    assert ref.budget is None and ref.admission_token is None
+    assert f"PTC_PYTHON_EXECUTABLE={sys.executable}" in args
+    assert f"PTC_SUBAGENTS_SOURCE={Path(tmuxenv.__file__).resolve().parents[2]}" in args
+    assert "PI_SUBAGENTS_MAX_DEPTH=1" in args
+    assert "PI_SUBAGENTS_MAX_CONCURRENT=3" in args
+    assert not any("PI_SUBAGENTS_PARENT_TOKEN=" in arg for arg in args)
+    assert not setup.events
+
+
+
 def test_exhausted_admission_fails_before_tmux_without_waiting(setup, tmp_path, monkeypatch):
     setup.exhausted = True
     monkeypatch.setattr(tmuxenv, "tmux", lambda *args: pytest.fail("must fail before tmux"))

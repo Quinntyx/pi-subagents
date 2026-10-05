@@ -37,6 +37,7 @@ def fake_handle(replies):
         name="schema-job", schema=SCHEMA, session=session,
         settled_data={"lastAssistant": initial}, send=send,
         _sync=SimpleNamespace(wait_settled=wait_settled),
+        _bounded_timeout=lambda timeout: timeout,
     )
     return handle, session, prompts, baselines
 

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .envcheck import require_environment, tmux
-from .recursion import RootBudget, ensure_can_spawn
+from .recursion import RootBudget, ensure_can_spawn, max_depth
 
 SOCK_DIR = Path.home() / ".pi" / "pi-sock"
 PROFILES_ROOT = Path.home() / ".config" / "pi" / "profiles"
@@ -165,10 +165,13 @@ def spawn_pi_window(
 	# reconciled without assuming an exception means no window was created.
 	marker = f"PI_SUBAGENTS_WINDOW_OWNER={token}"
 	try:
+		# Flat children still need PTC and the actual imported runtime.
+		child_environment = runtime_child_env()
 		if budget is not None:
-			child_environment = {**runtime_child_env(), **budget.child_env(token)}
-			for key, value in child_environment.items():
-				args += ["-e", f"{key}={value}"]
+			child_environment.update(budget.child_env(token))
+		for key, value in child_environment.items():
+			args += ["-e", f"{key}={value}"]
+		if budget is not None:
 			pi_cmd = f"exec env {shlex.quote(marker)} {pi_cmd}"
 		args.append(pi_cmd)
 		attempted = True
@@ -204,6 +207,8 @@ def runtime_child_env() -> dict[str, str]:
 		"PTC_PYTHON_EXECUTABLE": os.path.abspath(sys.executable),
 		"PTC_SUBAGENTS_SOURCE": str(source),
 		"PYTHONPATH": pythonpath,
+		"PI_SUBAGENTS_MAX_DEPTH": str(max_depth()),
+		"PI_SUBAGENTS_MAX_CONCURRENT": os.environ.get("PI_SUBAGENTS_MAX_CONCURRENT", "8"),
 	}
 	for key in ("PI_SOCK_DIR", "PI_CODING_SUBAGENT_DIR"):
 		if key in os.environ:
