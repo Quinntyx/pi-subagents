@@ -256,12 +256,42 @@ This tmux ID is separate from the durable pi conversation identity.
 - `PI_SUBAGENTS_CATALOG_TTL` (120 s) — model-catalog cache lifetime.
 - `PI_CODING_SUBAGENT_DIR` — the agent dir spawned subagents run under. Unset, subagents share the orchestrator's own agent dir (`PI_CODING_AGENT_DIR` or `~/.pi/agent`) — zero setup. Point it at any directory with a pi config (including a pi-profiles-managed profile) for a separate subagent environment.
 
+## Recursive admission
+
+The root Pi process is depth 0. `PI_SUBAGENTS_MAX_DEPTH=1` preserves flat
+orchestration; 2 allows grandchildren, and 3 allows one further generation.
+Depth values must be valid integers. Importing `pi_subagents` is legal at the
+maximum depth; attempting to spawn another child fails at that boundary.
+
+In recursive mode, all kernels and descendants of one Pi process share immutable
+root limits: `PI_SUBAGENTS_ROOT_MAX_CONCURRENT` bounds live windows (default the
+process cap), `PI_SUBAGENTS_ROOT_MAX_TASKS` bounds window admissions/reopens
+(default 512), and `PI_SUBAGENTS_ROOT_TIMEOUT` bounds admissions and waits
+(default 1800 seconds). They are not reset by creating a new kernel or pool;
+start a new root Pi process for a new budget. `PI_SUBAGENTS_MAX_CONCURRENT`
+remains the per-process active-work cap.
+
+Parents awaiting children still occupy live-window capacity. Reserve descendant
+headroom: exhausted root capacity fails fast instead of deadlocking behind a
+waiting parent. Retained failures remain charged until confirmed termination;
+Python launcher exit alone never releases a window. Successful validated
+sessions may become dormant automatically. Cancellation and explicit close
+terminate only owned descendants, never the caller or unrelated windows.
+A retained session can resume descendant admission after cleanup is resolved,
+but never beneath a closing ancestor.
+
+Children inherit the exact interpreter, source, and immutable root policy;
+launch reasserts them after shell startup. Children never install dependencies
+or acquire bootstrap locks. Nested telemetry is local to each orchestrator,
+not a recursive aggregate. Explicit task permission is required at every level.
+
 ## Rules
 
 - Top-level `await` is available inside `python_exec` chunks — `await handle`,
   never `asyncio.run(...)`.
-- Spawned agents cannot spawn agents (depth 1; `import pi_subagents` raises
-  there).
+- Recursive spawning is opt-in through `PI_SUBAGENTS_MAX_DEPTH`; the default
+  maximum of 1 remains flat. Imports are legal at the depth boundary; new
+  child admission is blocked there. Tasks must explicitly authorize nesting.
 - Statuses: `queued → starting → running → settled`, or `failed`
   (startup/provider error), `cancelled`, `closed` (pool closed). An errored
   provider turn may keep the turn waiting until `Task.timeout` fires — set

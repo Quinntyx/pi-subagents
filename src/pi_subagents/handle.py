@@ -360,6 +360,8 @@ class AgentHandle:
 			self._ready.result(timeout=self._bounded_timeout(_startup_timeout() + 5))
 		self._startup_error = None
 		self._await_ready()
+		if self._budget is not None and self._admission_token is not None:
+			self._budget.resume_admission(self._admission_token)
 		self._capture_outcome_baseline()
 		try:
 			self._wait_baseline = self._sync.message()

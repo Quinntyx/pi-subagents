@@ -53,6 +53,9 @@ class Budget:
         self.events.append(("release", token))
         self.records = [r for r in self.records if r["token"] != token]
 
+    def resume_admission(self, token):
+        self.events.append(("resume", token))
+
     def remaining_seconds(self):
         return self.remaining
 
@@ -103,6 +106,10 @@ def test_recursive_spawn_attaches_and_explicitly_pins_runtime(setup, tmp_path, m
     assert f"PTC_SUBAGENTS_SOURCE={source}" in args
     assert "PTC_SUBAGENTS_SOURCE=/stale/checkout" not in args
     assert setup.events == [("reserve", "worker", 1), ("attach", "owned-token", "@2")]
+    assert args[-1].startswith("exec env ")
+    for key, value in setup.child_env("owned-token").items():
+        assert f"{key}={value}" in args[-1]
+    assert f"PTC_PYTHON_EXECUTABLE={sys.executable}" in args[-1]
 
 
 def test_flat_children_reuse_runtime_without_recursive_admission(setup, tmp_path, monkeypatch):
@@ -240,6 +247,34 @@ def test_abort_closes_descendants_but_retains_parent_admission(setup, tmp_path, 
     assert ("unload", "@3") in setup.events
     assert ("release", "child") in setup.events
     assert ("release", "owned-token") not in setup.events
+
+
+
+
+def test_aborted_retained_parent_reopens_admission_before_followup(setup, tmp_path, monkeypatch):
+    h = make_handle(tmp_path, setup)
+    setup.records = [record("child", 2, "owned-token", "@3")]
+    monkeypatch.setattr(live, "unload_window", lambda wid: setup.events.append(("unload", wid)) or True)
+    monkeypatch.setattr(h._sync, "abort", lambda: {"aborted": True})
+    monkeypatch.setattr(h._sync, "message", lambda: None)
+    monkeypatch.setattr(h._sync, "send", lambda text, **kw: setup.events.append(("send", text)))
+    h.abort()
+    assert h.resume("continue") is h
+    assert h.status == "running" and h._admission_token == "owned-token"
+    assert setup.events.index(("resume", "owned-token")) < setup.events.index(("send", "continue"))
+    assert ("release", "owned-token") not in setup.events
+
+
+def test_retained_resume_rejects_closing_ancestor_before_prompt(setup, tmp_path, monkeypatch):
+    h = make_handle(tmp_path, setup)
+    h.status = "failed"
+    sent = []
+    monkeypatch.setattr(h._sync, "send", lambda *a, **kw: sent.append(a))
+    monkeypatch.setattr(setup, "resume_admission", lambda token: (_ for _ in ()).throw(
+        RuntimeError("ancestor subtree is closing")))
+    with pytest.raises(RuntimeError, match="ancestor subtree is closing"):
+        h.resume("continue")
+    assert not sent and h.status == "failed"
 
 
 def test_reopen_rechecks_policy_and_takes_fresh_admission(setup, tmp_path, monkeypatch):

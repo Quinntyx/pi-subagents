@@ -171,8 +171,13 @@ def spawn_pi_window(
 			child_environment.update(budget.child_env(token))
 		for key, value in child_environment.items():
 			args += ["-e", f"{key}={value}"]
+		# The default shell may overwrite -e variables in startup files (fish
+		# config commonly exports a different C). Reassert the complete child
+		# environment after shell startup, immediately before execing Pi.
+		launch_env = [args[index + 1] for index, arg in enumerate(args[:-1]) if arg == "-e"]
 		if budget is not None:
-			pi_cmd = f"exec env {shlex.quote(marker)} {pi_cmd}"
+			launch_env.append(marker)
+		pi_cmd = "exec env " + " ".join(shlex.quote(value) for value in launch_env) + " " + pi_cmd
 		args.append(pi_cmd)
 		attempted = True
 		window_id = tmux(*args).strip()

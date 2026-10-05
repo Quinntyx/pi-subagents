@@ -443,6 +443,29 @@ def test_begin_close_atomic_barrier_blocks_reserve_and_attach(root_environment, 
     child.release(pending)
     budget.release(parent)
 
+def test_resume_admission_requires_resolved_cleanup_and_open_ancestors(root_environment, monkeypatch):
+    budget = _root()
+    parent = budget.reserve("parent", 1)
+    budget.attach(parent, "@2")
+    child = _child(monkeypatch, budget.child_env(parent))
+    pending = child.reserve("pending", 2)
+    budget.begin_close(parent)
+    with pytest.raises(rec.RootBudgetError, match="unresolved"):
+        budget.resume_admission(parent)
+    child.release(pending)
+    budget.resume_admission(parent)
+    assert parent not in _state(budget)["closing"]
+    leaf = child.reserve("after-resume", 2)
+    child.attach(leaf, "@3")
+    budget.begin_close(parent)
+    with pytest.raises(rec.RootBudgetError, match="closing ancestor"):
+        child.resume_admission(leaf)
+    child.release(leaf)
+    budget.resume_admission(parent)
+    budget.resume_admission(parent)  # safe idempotent continuation
+    budget.release(parent)
+
+
 
 def test_multiprocess_close_vs_inflight_attach(root_environment):
     budget = _root()

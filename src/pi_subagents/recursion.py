@@ -509,6 +509,28 @@ class RootBudget:
             self._write(state)
             return descendants
 
+    def resume_admission(self, token: str) -> None:
+        """Restore a retained session only after complete subtree cleanup.
+
+        A closing ancestor remains authoritative; continuation cannot reopen a
+        subtree while its owner is cancelling it.
+        """
+        with self._locked() as state:
+            self._validate(state)
+            record = self._record(state, token)
+            if record["window_id"] is None:
+                raise RootBudgetError("cannot resume an unattached reservation")
+            if self._descendants(state, token):
+                raise RootBudgetError("cannot resume while descendant cleanup is unresolved")
+            parent = record["parent_token"]
+            while parent is not None:
+                if parent in state["closing"]:
+                    raise RootBudgetError("cannot resume beneath a closing ancestor")
+                parent = state["records"][parent]["parent_token"]
+            if token in state["closing"]:
+                state["closing"].remove(token)
+                self._write(state)
+
     def remaining_seconds(self) -> float:
         """Root time remaining; lifecycle must cap startup and settlement waits.
 
