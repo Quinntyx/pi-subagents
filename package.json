@@ -1,0 +1,16 @@
+{
+  "name": "pi-subagents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi-managed Python subagent runtime",
+  "scripts": {
+    "test": "node --test tests/runtime-extension.test.js"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["extensions/runtime.js"]
+  }
+}

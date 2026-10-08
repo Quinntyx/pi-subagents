@@ -12,6 +12,25 @@ socket. The library works both inside a PTC session (state is forwarded to the
 PTC runtime as `subagent_state` frames for live UI) and from plain scripts run
 directly in a tmux pane (state is printed as one-line status updates).
 
+## Install and update with Pi
+
+```bash
+pi install git:git.quinntyx.dev/quinntyx/pi-subagents@dev
+pi install git:git.quinntyx.dev/quinntyx/pi-pycells@dev
+```
+
+This package exposes its own installed source to pi-pycells, which provisions
+Python dependencies when orchestration is enabled. It never searches for a
+local development checkout. Push SDK changes to remote `dev`, then run:
+
+```bash
+pi update --extensions
+```
+
+Restart Pi and provision fresh kernels to import the updated SDK. Pi updates
+this package independently of pi-pycells; children keep the parent's pinned
+interpreter and source for the duration of a running workflow.
+
 ## The model
 
 Everything runs through an `AgentPool`: a bounded scheduler that owns stage
