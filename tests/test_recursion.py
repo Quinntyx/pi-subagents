@@ -572,6 +572,57 @@ def test_deadline_remaining_and_cleanup_after_expiry(root_environment, monkeypat
     budget.release(token)
 
 
+def test_root_deadline_excludes_quota_wait_union_and_historical_baseline(root_environment, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(rec.time, "monotonic", lambda: now[0])
+    monkeypatch.setenv("PI_SUBAGENTS_ROOT_TIMEOUT", "1")
+    budget = _root()
+    a = budget.reserve("first-clock", 1)
+    b = budget.reserve("different-clock", 1)
+    # Independent child counters (including historical waits) aren't inputs.
+    now[0] = 100.2
+    budget.observe_quota_wait(a, True)
+    now[0] = 105.0
+    assert budget.remaining_seconds() == pytest.approx(0.8)
+    budget.observe_quota_wait(b, True)
+    budget.observe_quota_wait(a, True)  # repeated reports are idempotent
+    now[0] = 106.0
+    budget.observe_quota_wait(a, False)
+    assert budget.remaining_seconds() == pytest.approx(0.8)
+    now[0] = 107.0
+    budget.observe_quota_wait(b, False)
+    assert _state(budget)["deadline"] == pytest.approx(107.8)
+    now[0] = 107.5
+    assert budget.remaining_seconds() == pytest.approx(0.3)
+    token = budget.reserve("after-quota", 1)
+    now[0] = 107.9
+    assert budget.remaining_seconds() == 0.0
+    with pytest.raises(rec.RootBudgetError, match="deadline exhausted"):
+        budget.reserve("late-after-resume", 1)
+    budget.release(token)
+    budget.release(a)
+    budget.release(b)
+
+
+def test_release_ends_root_quota_pause_on_cancellation(root_environment, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(rec.time, "monotonic", lambda: now[0])
+    monkeypatch.setenv("PI_SUBAGENTS_ROOT_TIMEOUT", "1")
+    budget = _root()
+    token = budget.reserve("cancelled-wait", 1)
+    now[0] = 100.1
+    budget.observe_quota_wait(token, True)
+    now[0] = 105.1
+    budget.release(token)
+    assert _state(budget)["deadline"] == pytest.approx(106.0)
+    assert _state(budget)["quota_wait_sources"] == {}
+    assert _state(budget)["quota_wait_started_at"] is None
+    now[0] = 106.1
+    assert budget.remaining_seconds() == 0.0
+    with pytest.raises(rec.RootBudgetError, match="live root reservation"):
+        budget.observe_quota_wait(token, True)
+
+
 @pytest.mark.parametrize("window", ["", "1", "@-1", "@1.2", "@1;kill", "%1", "@١"])
 def test_attach_window_validation(root_environment, window):
     budget = _root()

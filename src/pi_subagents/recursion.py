@@ -250,6 +250,8 @@ class RootBudget:
                     "root_pid": pid, "root_starttime": started,
                     "policy": budget._policy, "deadline": now + budget._policy["PI_SUBAGENTS_ROOT_TIMEOUT"],
                     "tasks": 0, "records": {}, "closing": [], "launchers": {}, "released": {},
+                    "quota_wait_sources": {},
+                    "quota_wait_started_at": None,
                 }
                 budget._validate(state)
                 budget._write(state)
@@ -330,6 +332,21 @@ class RootBudget:
                 raise ValueError("environment differs from immutable root policy")
             if type(state["deadline"]) not in (int, float) or not math.isfinite(state["deadline"]) or state["deadline"] <= 0:
                 raise ValueError("invalid deadline")
+            quota_sources = state.get("quota_wait_sources", {})
+            quota_started = state.get("quota_wait_started_at")
+            if not isinstance(quota_sources, dict) or any(
+                not isinstance(token, str) or active is not True
+                or token not in state.get("records", {})
+                for token, active in quota_sources.items()
+            ):
+                raise ValueError("invalid quota wait owners")
+            if bool(quota_sources) != (quota_started is not None) or (
+                quota_started is not None and (
+                    type(quota_started) not in (int, float)
+                    or not math.isfinite(quota_started) or quota_started < 0
+                )
+            ):
+                raise ValueError("invalid quota wait interval")
             records, released, tasks = state["records"], state["released"], state["tasks"]
             if not isinstance(records, dict) or not isinstance(released, dict) or set(records) & set(released):
                 raise ValueError("invalid reservation/tombstone maps")
@@ -413,7 +430,7 @@ class RootBudget:
         return record
 
     def _admit(self, state: dict) -> None:
-        if time.monotonic() >= state["deadline"]:
+        if self._remaining_locked(state) <= 0:
             raise RootBudgetError("root admission deadline exhausted; close existing descendants")
         if state["tasks"] >= self._policy["PI_SUBAGENTS_ROOT_MAX_TASKS"]:
             raise RootBudgetError("root admission task budget exhausted")
@@ -531,14 +548,55 @@ class RootBudget:
                 state["closing"].remove(token)
                 self._write(state)
 
-    def remaining_seconds(self) -> float:
-        """Root time remaining; lifecycle must cap startup and settlement waits.
+    @staticmethod
+    def _remaining_locked(state: dict) -> float:
+        # Every Pi child has its own cumulative pause counter. Root time uses
+        # the union of *live pause intervals*, never max/sum of those counters.
+        paused_since = state.get("quota_wait_started_at")
+        now = time.monotonic() if paused_since is None else paused_since
+        return max(0.0, state["deadline"] - now)
 
-        Cleanup remains legal when this reaches zero, but new admissions do not.
-        """
+    @staticmethod
+    def _set_quota_wait_locked(state: dict, token: str, active: bool) -> bool:
+        sources = state.setdefault("quota_wait_sources", {})
+        if active == (token in sources):
+            return False
+        now = time.monotonic()
+        if active:
+            if not sources:
+                state["quota_wait_started_at"] = now
+            sources[token] = True
+        else:
+            sources.pop(token, None)
+            if not sources:
+                started = state.get("quota_wait_started_at")
+                if started is not None:
+                    state["deadline"] += max(0.0, now - started)
+                state["quota_wait_started_at"] = None
+        return True
+
+    def remaining_seconds(self) -> float:
+        """Execution time remaining, excluding the union of live quota pauses."""
         with self._locked() as state:
             self._validate(state)
-            return max(0.0, state["deadline"] - time.monotonic())
+            return self._remaining_locked(state)
+
+    def observe_quota_wait(self, token: str, active: bool) -> None:
+        """Track a live reservation's quota pause without comparing child clocks.
+
+        The first active observation begins a live interval; historical elapsed
+        counters never grant extra root time. Any overlapping sibling keeps the
+        same interval open. Normal root expiry resumes when the last pause ends.
+        Release also closes a pause if cancellation/socket death ends the waiter.
+        """
+        if type(active) is not bool:
+            raise RootBudgetError("quota wait active must be a boolean")
+        with self._locked() as state:
+            self._validate(state)
+            if token not in state["records"]:
+                raise RootBudgetError("quota wait must belong to a live root reservation")
+            if self._set_quota_wait_locked(state, token, active):
+                self._write(state)
 
     def release(self, token: str) -> None:
         """Release AFTER confirmed termination; children must be released first.
@@ -557,6 +615,7 @@ class RootBudget:
                 raise RootBudgetError("pending startup may be in flight; only its reserving launcher can confirm no window and release")
             if any(other["parent_token"] == token for other in state["records"].values()):
                 raise RootBudgetError("cannot release a reservation with live descendants; close deepest first")
+            self._set_quota_wait_locked(state, token, False)
             state["released"][token] = dict(record)
             del state["records"][token]
             del state["launchers"][token]

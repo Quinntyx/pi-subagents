@@ -930,7 +930,13 @@ class AgentPool:
 
 		handle = job.handle
 		timeout = job.task.timeout if job.task.timeout is not None else _settle_timeout_default()
-		deadline = time.monotonic() + timeout
+		started = time.monotonic()
+		quota_baseline_ms = getattr(live, "_quota_wait_fresh_ms", 0)
+
+		def remaining_timeout() -> float:
+			fresh_quota_ms = max(0, getattr(live, "_quota_wait_fresh_ms", 0) - quota_baseline_ms)
+			return timeout - ((time.monotonic() - started) - fresh_quota_ms / 1000.0)
+
 		revision = -1
 		while True:
 			with handle._control_lock:
@@ -939,7 +945,7 @@ class AgentPool:
 					live._prepare_accepted_deliveries(tuple(handle._direct_deliveries))
 				revision = current
 			try:
-				remaining = deadline - time.monotonic()
+				remaining = remaining_timeout()
 				if remaining <= 0:
 					raise TimeoutError(f"subagent {handle.name}: accepted turn did not settle in time")
 				body = live.wait(timeout=remaining)

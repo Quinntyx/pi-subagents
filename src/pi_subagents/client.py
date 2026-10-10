@@ -89,6 +89,69 @@ def _assistant_outcome_marker(session_file: str | None) -> str | None:
 	return None
 
 
+def _quota_wait_snapshot(state: dict | None) -> tuple[bool, int | None]:
+	"""Return (active, elapsedMs) for the pi-sock provisioned-quota wait hint.
+
+	``elapsedMs`` is a process-wide monotonic cumulative counter supplied by the
+	parent Pi process.  Absence keeps legacy behavior unchanged.
+	"""
+	quota = (state or {}).get("quotaWait")
+	if not isinstance(quota, dict):
+		return False, None
+	elapsed = quota.get("elapsedMs")
+	if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+		elapsed_ms = None
+	else:
+		elapsed_ms = max(0, int(elapsed))
+	return bool(quota.get("active")), elapsed_ms
+
+
+def _quota_wait_active(state: dict | None) -> bool:
+	return _quota_wait_snapshot(state)[0]
+
+
+class _QuotaWaitExcluder:
+	"""Deadline helper that subtracts newly observed quota-wait time.
+
+	The first poll establishes the baseline so historical waits from earlier runs
+	(or from an already-active wait before this waiter began) do not extend this
+	wait. Later increases in the process-wide cumulative elapsed counter extend
+	the deadline. The active flag itself also suppresses settlement.
+	"""
+
+	def __init__(self, timeout: float | None, on_observed: Callable[[int, int, int, bool], Any] | None = None):
+		self.deadline = (time.monotonic() + timeout) if timeout is not None else None
+		self.active = False
+		self.baseline_ms: int | None = None
+		self.last_ms: int | None = None
+		self.on_observed = on_observed
+
+	def observe(self, state: dict | None) -> tuple[bool, Any]:
+		active, elapsed_ms = _quota_wait_snapshot(state)
+		self.active = active
+		callback_result = None
+		if elapsed_ms is None:
+			return active, callback_result
+		if self.baseline_ms is None:
+			self.baseline_ms = elapsed_ms
+			self.last_ms = elapsed_ms
+			if self.on_observed is not None:
+				callback_result = self.on_observed(elapsed_ms, self.baseline_ms, 0, active)
+			return active, callback_result
+		previous = self.last_ms if self.last_ms is not None else elapsed_ms
+		delta_ms = max(0, elapsed_ms - previous)
+		if delta_ms and self.deadline is not None:
+			self.deadline += delta_ms / 1000.0
+		self.last_ms = max(previous, elapsed_ms)
+		if self.on_observed is not None:
+			callback_result = self.on_observed(elapsed_ms, self.baseline_ms, delta_ms, active)
+		return active, callback_result
+
+	def expired(self) -> bool:
+		return not self.active and self.deadline is not None and time.monotonic() >= self.deadline
+
+
+
 def _last_assistant_outcome(session_file: str | None) -> tuple[str, str | None] | None:
 	"""Best-effort terminal outcome of the latest persisted assistant entry."""
 	marker = _assistant_outcome_marker(session_file)
@@ -287,6 +350,8 @@ class SockClient:
 		poll: float = DEFAULT_POLL_INTERVAL,
 		on_tick: Callable[[dict], None] | None = None,
 		after_message: dict | None = None,
+		on_quota_observed: Callable[[int, int, int, bool], Any] | None = None,
+		root_remaining: Callable[[], float] | None = None,
 	) -> dict | None:
 		"""Wait until the agent settles.
 
@@ -301,7 +366,7 @@ class SockClient:
 		  (last assistant message has stopReason "aborted"). Callers surface this
 		  as a failed result instead of a silent drain.
 		"""
-		deadline = (time.monotonic() + timeout) if timeout is not None else None
+		quota = _QuotaWaitExcluder(timeout, on_quota_observed)
 		while True:
 			if self.sock_path and not os.path.exists(self.sock_path):
 				raise PiSockSessionEnded(
@@ -313,7 +378,8 @@ class SockClient:
 				raise PiSockSessionEnded(
 					f"pi session ended before settling ({error})"
 				) from error
-			if state.get("isIdle") and not state.get("hasPendingMessages"):
+			quota_active, quota_callback = quota.observe(state)
+			if state.get("isIdle") and not state.get("hasPendingMessages") and not quota_active:
 				marker = (_delivered_assistant_marker(state.get("sessionFile"), self._after_deliveries)
 				          if self._after_deliveries is not None else
 				          _assistant_outcome_marker(state.get("sessionFile")))
@@ -325,7 +391,7 @@ class SockClient:
 					return {**state, "lastAssistant": last, "isIdle": True}
 			if on_tick is not None:
 				on_tick(state)
-			if deadline is not None and time.monotonic() >= deadline:
+			if quota.expired() or (not quota_active and root_remaining is not None and root_remaining() <= 0):
 				return None
 			time.sleep(poll)
 
@@ -429,8 +495,10 @@ class AsyncSockClient:
 		poll: float = DEFAULT_POLL_INTERVAL,
 		on_tick: Callable[[dict], Any] | None = None,
 		after_message: dict | None = None,
+		on_quota_observed: Callable[[int, int, int, bool], Any] | None = None,
+		root_remaining: Callable[[], float] | None = None,
 	) -> dict | None:
-		deadline = (time.monotonic() + timeout) if timeout is not None else None
+		quota = _QuotaWaitExcluder(timeout, on_quota_observed)
 		while True:
 			if self.sock_path and not os.path.exists(self.sock_path):
 				raise PiSockSessionEnded(
@@ -442,7 +510,10 @@ class AsyncSockClient:
 				raise PiSockSessionEnded(
 					f"pi session ended before settling ({error})"
 				) from error
-			if state.get("isIdle") and not state.get("hasPendingMessages"):
+			quota_active, quota_callback = quota.observe(state)
+			if asyncio.iscoroutine(quota_callback):
+				await quota_callback
+			if state.get("isIdle") and not state.get("hasPendingMessages") and not quota_active:
 				if self._after_deliveries is not None:
 					marker = await asyncio.to_thread(_delivered_assistant_marker, state.get("sessionFile"), self._after_deliveries)
 				else:
@@ -457,6 +528,6 @@ class AsyncSockClient:
 				result = on_tick(state)
 				if asyncio.iscoroutine(result):
 					await result
-			if deadline is not None and time.monotonic() >= deadline:
+			if quota.expired() or (not quota_active and root_remaining is not None and root_remaining() <= 0):
 				return None
 			await asyncio.sleep(poll)

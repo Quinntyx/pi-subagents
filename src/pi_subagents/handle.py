@@ -18,7 +18,8 @@ from typing import Any
 
 from .client import (
 	AsyncSockClient, PiSockError, PiSockSessionEnded, PiSockUnavailable, SockClient,
-	_last_assistant_outcome, _assistant_outcome_marker, raise_for_failed_outcome,
+	_last_assistant_outcome, _assistant_outcome_marker, _quota_wait_active,
+	raise_for_failed_outcome,
 )
 from .errors import PiSubagentsError, PiSubagentsTimeoutError
 from .envcheck import require_environment
@@ -137,6 +138,10 @@ class AgentHandle:
 		# produce a different message so a retained session cannot return stale data.
 		self._wait_baseline: dict | None = None
 		self._settlement_revision = 0
+		# Fresh provisioned-quota wait observed during the current turn. Execution
+		# deadlines exclude this time; each wait establishes its own historical
+		# baseline, so old quota waits from earlier runs are ignored.
+		self._quota_wait_fresh_ms = 0
 		# Readiness/delivery of the initial prompt (see _run_startup).
 		self._ready: concurrent.futures.Future = concurrent.futures.Future()
 		self._startup_error: Exception | None = None
@@ -158,6 +163,12 @@ class AgentHandle:
 		self.status = "starting"
 
 	# -- startup: readiness + first prompt over pi-sock -------------------------
+
+	def _settlement_timeout(self, timeout: float) -> float:
+		# Validate root admission now, but don't freeze its remaining time into
+		# a per-child deadline. A sibling can subsequently pause the shared root.
+		self._bounded_timeout(timeout)
+		return timeout
 
 	def _bounded_timeout(self, timeout: float) -> float:
 		"""Root deadline bounds existing work as well as new window admissions."""
@@ -389,6 +400,7 @@ class AgentHandle:
 		self._busy_ms = 0.0
 		self._busy_since = self.started_at
 		self._idle = False
+		self._quota_wait_fresh_ms = 0
 		self.last_outcome = None
 		# Freeze historical inspection before the continuation appends new turns.
 		if self._session is not None:
@@ -680,10 +692,12 @@ class AgentHandle:
 		revision = self._settlement_revision
 		try:
 			settle = self._sync.wait_settled(
-				self._bounded_timeout(timeout if timeout is not None else _settle_timeout_default()),
+				self._settlement_timeout(timeout if timeout is not None else _settle_timeout_default()),
 				poll=poll,
 				on_tick=self._tick_sync,
 				after_message=self._wait_baseline,
+				on_quota_observed=self._quota_wait_observed,
+				root_remaining=self._budget.remaining_seconds if self._budget is not None else None,
 			)
 		finally:
 			self.awaited = False
@@ -713,10 +727,12 @@ class AgentHandle:
 		revision = self._settlement_revision
 		try:
 			settle = await self._async.wait_settled(
-				self._bounded_timeout(timeout if timeout is not None else _settle_timeout_default()),
+				self._settlement_timeout(timeout if timeout is not None else _settle_timeout_default()),
 				poll=poll,
 				on_tick=self._tick_async,
 				after_message=self._wait_baseline,
+				on_quota_observed=self._quota_wait_observed,
+				root_remaining=self._budget.remaining_seconds if self._budget is not None else None,
 			)
 		except PiSockUnavailable:
 			self._mark_dead()
@@ -792,6 +808,14 @@ class AgentHandle:
 			await self.activity_async()
 		except Exception:
 			pass
+
+	def _quota_wait_observed(self, elapsed_ms: int, baseline_ms: int, delta_ms: int, active: bool) -> None:
+		"""Propagate quota-wait accounting to live and root deadlines."""
+		self._quota_wait_fresh_ms += max(0, int(delta_ms))
+		if self._budget is not None:
+			observe = getattr(self._budget, "observe_quota_wait", None)
+			if observe is not None:
+				observe(self._admission_token, active)
 
 	def _tick_sync(self, state: dict) -> None:
 		self._absorb_from_state(state)
@@ -905,13 +929,25 @@ def _dict_response(handle: AgentHandle, text: str, session) -> "AgentDictRespons
 		if capture is not None:
 			capture()
 		handle.send(_schema_retry_prompt(handle.schema, error), mode="follow_up")
-		settle = handle._sync.wait_settled(
-			handle._bounded_timeout(_settle_timeout_default()), after_message=baseline,
-			on_tick=lambda state: _raise_for_failed_schema_turn(
+		wait_kwargs = {
+			"after_message": baseline,
+			"on_tick": lambda state: _raise_for_failed_schema_turn(
 				handle, session,
-				# pi can retry provider failures internally while still running.
-				check_outcome=bool(state.get("isIdle") and not state.get("hasPendingMessages")),
+				# pi can retry provider failures internally while still running; a
+				# provisioned-quota pause may report idle and preserve a terminal-looking
+				# placeholder, but it is not terminal until quotaWait.active is false.
+				check_outcome=bool(state.get("isIdle") and not state.get("hasPendingMessages") and not _quota_wait_active(state)),
 			),
+		}
+		quota_observed = getattr(handle, "_quota_wait_observed", None)
+		if quota_observed is not None:
+			wait_kwargs["on_quota_observed"] = quota_observed
+		budget = getattr(handle, "_budget", None)
+		if budget is not None:
+			wait_kwargs["root_remaining"] = budget.remaining_seconds
+		settlement_timeout = getattr(handle, "_settlement_timeout", handle._bounded_timeout)
+		settle = handle._sync.wait_settled(
+			settlement_timeout(_settle_timeout_default()), **wait_kwargs,
 		)
 		if settle is None:
 			raise PiSubagentsTimeoutError(f"subagent {handle.name}: schema repair timed out")

@@ -304,6 +304,22 @@ launch reasserts them after shell startup. Children never install dependencies
 or acquire bootstrap locks. Nested telemetry is local to each orchestrator,
 not a recursive aggregate. Explicit task permission is required at every level.
 
+## Provisioned-quota pauses
+
+Updated `pi-session-quota` and `pi-sock` report `quotaWait: {active, elapsedMs}`
+in socket state. These waits remain live runs: they do not settle Futures and do
+not consume task/settlement execution deadlines. Each waiter baselines historical
+pause time. Shared root deadlines pause for the union of live reservation-owned
+quota intervals, even when sibling Pi processes have different pause counters.
+Normal execution and root timeouts resume afterward; cancellation, socket death,
+and terminal weekly quota errors still fail normally. `pool.pop(timeout=...)`
+remains a caller-side bounded wait, not an execution timeout or task completion.
+Older sockets without quota state retain ordinary timeout behavior.
+
+Update all three components together and reload Pi. Existing Python notebook
+kernels retain imported modules; reset/restart the kernel before launching a new
+pool after an update. Do not reset a kernel with a workflow you need to preserve.
+
 ## Rules
 
 - Top-level `await` is available inside `python_exec` chunks — `await handle`,
