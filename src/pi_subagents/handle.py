@@ -700,6 +700,7 @@ class AgentHandle:
 				root_remaining=self._budget.remaining_seconds if self._budget is not None else None,
 			)
 		finally:
+			self._clear_quota_wait()
 			self.awaited = False
 			REGISTRY.emit()
 		if revision != self._settlement_revision:
@@ -738,6 +739,7 @@ class AgentHandle:
 			self._mark_dead()
 			raise
 		finally:
+			self._clear_quota_wait()
 			self.awaited = False
 			REGISTRY.emit()
 		if revision != self._settlement_revision:
@@ -808,6 +810,11 @@ class AgentHandle:
 			await self.activity_async()
 		except Exception:
 			pass
+
+	def _clear_quota_wait(self) -> None:
+		# A dead socket or cancelled waiter must not leave the shared root frozen.
+		if self._budget is not None and self._admission_token is not None:
+			self._budget.observe_quota_wait(self._admission_token, False)
 
 	def _quota_wait_observed(self, elapsed_ms: int, baseline_ms: int, delta_ms: int, active: bool) -> None:
 		"""Propagate quota-wait accounting to live and root deadlines."""

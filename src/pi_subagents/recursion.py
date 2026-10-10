@@ -594,6 +594,8 @@ class RootBudget:
         with self._locked() as state:
             self._validate(state)
             if token not in state["records"]:
+                if not active and token in state["released"]:
+                    return  # cancellation may have already released the owner
                 raise RootBudgetError("quota wait must belong to a live root reservation")
             if self._set_quota_wait_locked(state, token, active):
                 self._write(state)

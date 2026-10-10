@@ -167,3 +167,25 @@ def test_client_enforces_live_root_guard_without_freezing_initial_allowance(tmp_
     remaining[0] = 0
     thread.join(2)
     assert outcome == [None], "a live root deadline still terminates normal work"
+
+
+def test_live_wait_clears_root_pause_when_socket_dies(tmp_path):
+    server = FakePiSockServer(str(tmp_path), "dead-quota-socket")
+    live = LiveHandle("work", name="dead-quota-socket", cwd=str(tmp_path),
+                      window_name="unused", model=None, thinking=None, schema=None)
+    ref = type("Ref", (), {"window_id": "@fake", "socket_path": server.sock_path, "name": live.name})()
+    live._bind(ref)
+    live._ready.set_result(None)
+    observations = []
+    class Budget:
+        def remaining_seconds(self): return 1.0
+        def observe_quota_wait(self, token, active): observations.append((token, active))
+    live._budget = Budget()
+    live._admission_token = "owned-token"
+    def dead_wait(*args, **kwargs):
+        kwargs["on_quota_observed"](100, 0, 100, True)
+        raise PiSockSessionEnded("socket died")
+    live._sync.wait_settled = dead_wait
+    with pytest.raises(PiSockSessionEnded, match="socket died"):
+        live.wait(timeout=1)
+    assert observations == [("owned-token", True), ("owned-token", False)]

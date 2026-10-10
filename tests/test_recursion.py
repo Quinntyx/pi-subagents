@@ -617,6 +617,7 @@ def test_release_ends_root_quota_pause_on_cancellation(root_environment, monkeyp
     assert _state(budget)["deadline"] == pytest.approx(106.0)
     assert _state(budget)["quota_wait_sources"] == {}
     assert _state(budget)["quota_wait_started_at"] is None
+    budget.observe_quota_wait(token, False)
     now[0] = 106.1
     assert budget.remaining_seconds() == 0.0
     with pytest.raises(rec.RootBudgetError, match="live root reservation"):
